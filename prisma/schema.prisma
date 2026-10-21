@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// 1. STRUCTURATION TEMPORELLE
+// -----------------------------------------------------------------------------
+
+model AnneeScolaire {
+  id_annee      Int      @id @default(autoincrement())
+  libelle_annee String   @unique 
+  est_active    Boolean  @default(false) 
+
+  trimestres         Trimestre[]
+  affectationsEleves AffectationEleve[]
+  affectationsCours  AffectationCours[]
+}
+
+model Trimestre {
+  id_trimestre     Int @id @default(autoincrement())
+  numero_trimestre Int 
+  id_annee         Int
+  annee            AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Cascade)
+  sequences        Sequence[]
+}
+
+model Sequence {
+  id_sequence     Int @id @default(autoincrement())
+  numero_sequence Int 
+  id_trimestre    Int
+  trimestre       Trimestre @relation(fields: [id_trimestre], references: [id_trimestre], onDelete: Cascade)
+  notes           Note[]
+}
+
+// -----------------------------------------------------------------------------
+// 2. ACTEURS & STRUCTURES ACADÉMIQUES
+// -----------------------------------------------------------------------------
+
+model Classe {
+  id_classe  Int    @id @default(autoincrement())
+  nom_classe String 
+  eleves       AffectationEleve[]
+  affectations AffectationCours[]
+}
+
+model Eleve {
+  id_eleve    Int     @id @default(autoincrement())
+  nom_complet String  
+  est_actif   Boolean @default(true) 
+  classes     AffectationEleve[]
+  notes       Note[]
+}
+
+model Matiere {
+  id_matiere      Int    @id @default(autoincrement())
+  libelle_matiere String 
+  affectations    AffectationCours[]
+  notes           Note[]
+}
+
+model Enseignant {
+  id_enseignant Int     @id @default(autoincrement())
+  nom_complet   String  
+  mot_de_passe  String  
+  est_actif     Boolean @default(true) 
+  affectations  AffectationCours[]
+}
+
+// -----------------------------------------------------------------------------
+// 3. TABLES DE LIAISON
+// -----------------------------------------------------------------------------
+
+model AffectationEleve {
+  id_affectation Int @id @default(autoincrement())
+  id_eleve       Int
+  id_classe      Int
+  id_annee       Int
+
+  eleve  Eleve         @relation(fields: [id_eleve], references: [id_eleve], onDelete: Cascade)
+  classe Classe        @relation(fields: [id_classe], references: [id_classe], onDelete: Cascade)
+  annee  AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Cascade)
+
+  @@unique([id_eleve, id_annee])
+}
+
+model AffectationCours {
+  id_affectation_cours Int @id @default(autoincrement())
+  id_enseignant        Int
+  id_matiere           Int
+  id_classe            Int
+  id_annee             Int
+
+  enseignant Enseignant    @relation(fields: [id_enseignant], references: [id_enseignant], onDelete: Cascade)
+  matiere    Matiere       @relation(fields: [id_matiere], references: [id_matiere], onDelete: Cascade)
+  classe     Classe        @relation(fields: [id_classe], references: [id_classe], onDelete: Cascade)
+  annee      AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Cascade)
+
+  @@unique([id_enseignant, id_matiere, id_classe, id_annee])
+}
+
+model Note {
+  id_note     Int   @id @default(autoincrement())
+  id_eleve    Int
+  id_matiere  Int
+  id_sequence Int
+  valeur_note Float 
+
+  eleve    Eleve    @relation(fields: [id_eleve], references: [id_eleve], onDelete: Cascade)
+  matiere  Matiere  @relation(fields: [id_matiere], references: [id_matiere], onDelete: Cascade)
+  sequence Sequence @relation(fields: [id_sequence], references: [id_sequence], onDelete: Cascade)
+
+  @@unique([id_eleve, id_matiere, id_sequence])
+}
