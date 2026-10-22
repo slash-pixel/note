@@ -1,11 +1,10 @@
-
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
@@ -105,7 +104,6 @@ model AffectationEleve {
   // pendant une année scolaire.
 
   @@unique([id_eleve, id_annee])
-
   @@index([id_classe, id_annee])
 }
 
@@ -135,7 +133,6 @@ model AffectationCours {
   // par classe et par année scolaire.
 
   @@unique([id_matiere, id_classe, id_annee])
-
   @@index([id_classe, id_annee])
   @@index([id_enseignant, id_annee])
 }
@@ -162,7 +159,6 @@ model Note {
   // Une seule note par élève, cours et séquence.
 
   @@unique([id_eleve, id_affectation_cours, id_sequence])
-
   @@index([id_sequence])
   @@index([id_affectation_cours])
 }
