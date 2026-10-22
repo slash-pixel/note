@@ -1,20 +1,22 @@
+
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
-// -----------------------------------------------------------------------------
+// --------------------------------------------------
 // 1. STRUCTURATION TEMPORELLE
-// -----------------------------------------------------------------------------
+// --------------------------------------------------
 
 model AnneeScolaire {
-  id_annee      Int      @id @default(autoincrement())
-  libelle_annee String   @unique 
-  est_active    Boolean  @default(false) 
+  id_annee      String  @id @default(uuid()) @db.Uuid
+  libelle_annee String  @unique
+  est_active    Boolean @default(false)
 
   trimestres         Trimestre[]
   affectationsEleves AffectationEleve[]
@@ -22,97 +24,145 @@ model AnneeScolaire {
 }
 
 model Trimestre {
-  id_trimestre     Int @id @default(autoincrement())
-  numero_trimestre Int 
-  id_annee         Int
-  annee            AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Cascade)
-  sequences        Sequence[]
+  id_trimestre     String @id @default(uuid()) @db.Uuid
+  numero_trimestre Int
+  id_annee         String @db.Uuid
+
+  annee AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Restrict)
+
+  sequences Sequence[]
+
+  @@unique([id_annee, numero_trimestre])
 }
 
 model Sequence {
-  id_sequence     Int @id @default(autoincrement())
-  numero_sequence Int 
-  id_trimestre    Int
-  trimestre       Trimestre @relation(fields: [id_trimestre], references: [id_trimestre], onDelete: Cascade)
-  notes           Note[]
+  id_sequence     String @id @default(uuid()) @db.Uuid
+  numero_sequence Int
+  id_trimestre    String @db.Uuid
+
+  trimestre Trimestre @relation(fields: [id_trimestre], references: [id_trimestre], onDelete: Restrict)
+
+  notes Note[]
+
+  @@unique([id_trimestre, numero_sequence])
 }
 
-// -----------------------------------------------------------------------------
-// 2. ACTEURS & STRUCTURES ACADÉMIQUES
-// -----------------------------------------------------------------------------
+// --------------------------------------------------
+// 2. STRUCTURES ACADÉMIQUES
+// --------------------------------------------------
 
 model Classe {
-  id_classe  Int    @id @default(autoincrement())
-  nom_classe String 
+  id_classe  String @id @default(uuid()) @db.Uuid
+  nom_classe String @unique
+
   eleves       AffectationEleve[]
   affectations AffectationCours[]
 }
 
 model Eleve {
-  id_eleve    Int     @id @default(autoincrement())
-  nom_complet String  
-  est_actif   Boolean @default(true) 
-  classes     AffectationEleve[]
-  notes       Note[]
+  id_eleve    String  @id @default(uuid()) @db.Uuid
+  nom_complet String
+  est_actif   Boolean @default(true)
+
+  classes AffectationEleve[]
+  notes   Note[]
 }
 
 model Matiere {
-  id_matiere      Int    @id @default(autoincrement())
-  libelle_matiere String 
-  affectations    AffectationCours[]
-  notes           Note[]
+  id_matiere      String @id @default(uuid()) @db.Uuid
+  libelle_matiere String @unique
+
+  affectations AffectationCours[]
 }
 
 model Enseignant {
-  id_enseignant Int     @id @default(autoincrement())
-  nom_complet   String  
-  mot_de_passe  String  
-  est_actif     Boolean @default(true) 
-  affectations  AffectationCours[]
+  id_enseignant String  @id @default(uuid()) @db.Uuid
+  nom_complet   String
+  mot_de_passe  String
+  est_actif     Boolean @default(true)
+
+  affectations AffectationCours[]
 }
 
-// -----------------------------------------------------------------------------
-// 3. TABLES DE LIAISON
-// -----------------------------------------------------------------------------
+// --------------------------------------------------
+// 3. AFFECTATION DES ÉLÈVES
+// --------------------------------------------------
 
 model AffectationEleve {
-  id_affectation Int @id @default(autoincrement())
-  id_eleve       Int
-  id_classe      Int
-  id_annee       Int
+  id_affectation String @id @default(uuid()) @db.Uuid
 
-  eleve  Eleve         @relation(fields: [id_eleve], references: [id_eleve], onDelete: Cascade)
-  classe Classe        @relation(fields: [id_classe], references: [id_classe], onDelete: Cascade)
-  annee  AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Cascade)
+  id_eleve  String @db.Uuid
+  id_classe String @db.Uuid
+  id_annee  String @db.Uuid
+
+  eleve Eleve @relation(fields: [id_eleve], references: [id_eleve], onDelete: Restrict)
+
+  classe Classe @relation(fields: [id_classe], references: [id_classe], onDelete: Restrict)
+
+  annee AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Restrict)
+
+  // Un élève appartient à une seule classe
+  // pendant une année scolaire.
 
   @@unique([id_eleve, id_annee])
+
+  @@index([id_classe, id_annee])
 }
+
+// --------------------------------------------------
+// 4. AFFECTATION DES COURS
+// --------------------------------------------------
 
 model AffectationCours {
-  id_affectation_cours Int @id @default(autoincrement())
-  id_enseignant        Int
-  id_matiere           Int
-  id_classe            Int
-  id_annee             Int
+  id_affectation_cours String @id @default(uuid()) @db.Uuid
 
-  enseignant Enseignant    @relation(fields: [id_enseignant], references: [id_enseignant], onDelete: Cascade)
-  matiere    Matiere       @relation(fields: [id_matiere], references: [id_matiere], onDelete: Cascade)
-  classe     Classe        @relation(fields: [id_classe], references: [id_classe], onDelete: Cascade)
-  annee      AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Cascade)
+  id_enseignant String @db.Uuid
+  id_matiere    String @db.Uuid
+  id_classe     String @db.Uuid
+  id_annee      String @db.Uuid
 
-  @@unique([id_enseignant, id_matiere, id_classe, id_annee])
+  enseignant Enseignant @relation(fields: [id_enseignant], references: [id_enseignant], onDelete: Restrict)
+
+  matiere Matiere @relation(fields: [id_matiere], references: [id_matiere], onDelete: Restrict)
+
+  classe Classe @relation(fields: [id_classe], references: [id_classe], onDelete: Restrict)
+
+  annee AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Restrict)
+
+  notes Note[]
+
+  // Une matière possède un seul enseignant
+  // par classe et par année scolaire.
+
+  @@unique([id_matiere, id_classe, id_annee])
+
+  @@index([id_classe, id_annee])
+  @@index([id_enseignant, id_annee])
 }
 
+// --------------------------------------------------
+// 5. GESTION DES NOTES
+// --------------------------------------------------
+
 model Note {
-  id_note     Int   @id @default(autoincrement())
-  id_eleve    Int
-  id_matiere  Int
-  id_sequence Int
-  valeur_note Float 
+  id_note String @id @default(uuid()) @db.Uuid
 
-  eleve    Eleve    @relation(fields: [id_eleve], references: [id_eleve], onDelete: Cascade)
-  matiere  Matiere  @relation(fields: [id_matiere], references: [id_matiere], onDelete: Cascade)
-  sequence Sequence @relation(fields: [id_sequence], references: [id_sequence], onDelete: Cascade)
+  id_eleve             String @db.Uuid
+  id_affectation_cours String @db.Uuid
+  id_sequence          String @db.Uuid
 
-  @@unique([id_eleve, id_matiere, id_sequence])
+  valeur_note Decimal @db.Decimal(5, 2)
+
+  eleve Eleve @relation(fields: [id_eleve], references: [id_eleve], onDelete: Restrict)
+
+  affectationCours AffectationCours @relation(fields: [id_affectation_cours], references: [id_affectation_cours], onDelete: Restrict)
+
+  sequence Sequence @relation(fields: [id_sequence], references: [id_sequence], onDelete: Restrict)
+
+  // Une seule note par élève, cours et séquence.
+
+  @@unique([id_eleve, id_affectation_cours, id_sequence])
+
+  @@index([id_sequence])
+  @@index([id_affectation_cours])
 }

@@ -4,67 +4,120 @@ import { PrismaClient } from '@prisma/client';
 import { sign, verify } from 'hono/jwt';
 import { z } from 'zod';
 
+type JwtPayload = {
+  id_enseignant: string;
+  nom_complet: string;
+  exp: number;
+};
+
 const prisma = new PrismaClient();
-const notesApp = new Hono();
+const notesApp = new Hono<{ Variables: { jwtPayload: JwtPayload } }>();
 const JWT_SECRET = process.env.JWT_SECRET || 'cle-secrete-super-securisee';
+
+const uuid = z.string().uuid();
+
+// -----------------------------------------------------------------------------
+// OUTILS
+// -----------------------------------------------------------------------------
+
+const getAnneeActive = () =>
+  prisma.anneeScolaire.findFirst({ where: { est_active: true } });
+
+// Retourne l'affectation (matière + classe + année) UNIQUEMENT si l'enseignant
+// connecté en est bien le titulaire. Sinon null => accès refusé.
+const affectationDeLEnseignant = async (
+  id_enseignant: string,
+  id_matiere: string,
+  id_classe: string,
+  id_annee: string
+) => {
+  const affectation = await prisma.affectationCours.findUnique({
+    where: {
+      id_matiere_id_classe_id_annee: { id_matiere, id_classe, id_annee }
+    }
+  });
+  return affectation && affectation.id_enseignant === id_enseignant
+    ? affectation
+    : null;
+};
+
+// La séquence appartient-elle bien à l'année active ?
+const sequenceDansAnnee = (id_sequence: string, id_annee: string) =>
+  prisma.sequence.findFirst({
+    where: { id_sequence, trimestre: { id_annee } }
+  });
 
 // -----------------------------------------------------------------------------
 // 1. ENDPOINTS POUR LE FORMULAIRE DE CONNEXION (Listes dynamiques)
 // -----------------------------------------------------------------------------
 
 notesApp.get('/trimestres', async (c) => {
-  const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
+  const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
   const trimestres = await prisma.trimestre.findMany({
     where: { id_annee: anneeActive.id_annee },
-    include: { sequences: true }
+    orderBy: { numero_trimestre: 'asc' },
+    include: { sequences: { orderBy: { numero_sequence: 'asc' } } }
   });
   return c.json(trimestres);
 });
 
 notesApp.get('/classes', async (c) => {
-  const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
+  const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
-  // Récupération de toutes les classes sans exclure celles sans élèves affectés
+  // Avec des UUID, trier par id donne un ordre aléatoire : on trie par nom
   const classes = await prisma.classe.findMany({
-    orderBy: {
-      id_classe: 'asc'
-    }
+    orderBy: { nom_classe: 'asc' }
   });
   return c.json(classes);
 });
 
 notesApp.get('/classes/:id_classe/matieres', async (c) => {
-  const id_classe = Number(c.req.param('id_classe'));
-  const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
+  const parsed = uuid.safeParse(c.req.param('id_classe'));
+  if (!parsed.success) return c.json({ error: "Identifiant de classe invalide" }, 400);
+  const id_classe = parsed.data;
+
+  const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
+  // Une matière n'apparaît qu'une fois par classe (contrainte d'unicité)
   const affectations = await prisma.affectationCours.findMany({
     where: { id_classe, id_annee: anneeActive.id_annee },
-    include: { matiere: true }
+    include: { matiere: true },
+    orderBy: { matiere: { libelle_matiere: 'asc' } }
   });
 
-  const matieres = Array.from(new Set(affectations.map(a => JSON.stringify(a.matiere)))).map(m => JSON.parse(m));
-  return c.json(matieres);
+  return c.json(affectations.map(a => a.matiere));
+});
+
+const filtresQuerySchema = z.object({
+  id_classe: uuid,
+  id_matiere: uuid
 });
 
 notesApp.get('/enseignants/filtres', async (c) => {
-  const id_classe = Number(c.req.query('id_classe'));
-  const id_matiere = Number(c.req.query('id_matiere'));
-  const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
+  const query = filtresQuerySchema.safeParse(c.req.query());
+  if (!query.success) return c.json({ error: "Paramètres invalides" }, 400);
+  const { id_classe, id_matiere } = query.data;
+
+  const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
+  // Un seul enseignant par matière et par classe : on renvoie une liste
+  // (0 ou 1 élément) pour garder le même format côté front.
   const affectations = await prisma.affectationCours.findMany({
     where: { id_classe, id_matiere, id_annee: anneeActive.id_annee },
     include: { enseignant: true }
   });
 
-  const enseignants = affectations.map(a => ({
-    id_enseignant: a.enseignant.id_enseignant,
-    nom_complet: a.enseignant.nom_complet
-  }));
+  const enseignants = affectations
+    .filter(a => a.enseignant.est_actif)
+    .map(a => ({
+      id_enseignant: a.enseignant.id_enseignant,
+      nom_complet: a.enseignant.nom_complet
+    }));
 
   return c.json(enseignants);
 });
@@ -74,7 +127,7 @@ notesApp.get('/enseignants/filtres', async (c) => {
 // -----------------------------------------------------------------------------
 
 const loginSchema = z.object({
-  id_enseignant: z.number(),
+  id_enseignant: uuid,
   mot_de_passe: z.string().min(1)
 });
 
@@ -109,7 +162,10 @@ notesApp.post('/auth/login', async (c) => {
     return c.json({ token, message: "Connexion réussie" });
   } catch (error) {
     console.error("ERREUR LOGIN :", error);
-    return c.json({ error: "Erreur interne du serveur", details: String(error) }, 500);
+    return c.json({
+      error: "Erreur interne du serveur",
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error)
+    }, 500);
   }
 });
 
@@ -146,34 +202,59 @@ notesApp.use('/notes/*', async (c, next) => {
 
     return c.json({
       error: "Session expirée ou non autorisée",
-      details: String(error)
+      details: process.env.NODE_ENV === 'production' ? undefined : String(error)
     }, 401);
   }
 
-  c.set('jwtPayload', payload);
+  // Le token doit bien identifier un enseignant (UUID)
+  if (!uuid.safeParse(payload.id_enseignant).success) {
+    return c.json({ error: "Token invalide" }, 401);
+  }
+
+  c.set('jwtPayload', payload as unknown as JwtPayload);
 
   // Exécuté en dehors du try/catch JWT pour ne pas masquer les erreurs métier/Prisma
   await next();
 });
 
-notesApp.get('/notes/grille', async (c) => {
-  const id_classe = Number(c.req.query('id_classe'));
-  const id_matiere = Number(c.req.query('id_matiere'));
-  const id_sequence = Number(c.req.query('id_sequence'));
+const grilleQuerySchema = z.object({
+  id_classe: uuid,
+  id_matiere: uuid,
+  id_sequence: uuid
+});
 
-  const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
+notesApp.get('/notes/grille', async (c) => {
+  const query = grilleQuerySchema.safeParse(c.req.query());
+  if (!query.success) return c.json({ error: "Paramètres invalides" }, 400);
+  const { id_classe, id_matiere, id_sequence } = query.data;
+
+  const { id_enseignant } = c.get('jwtPayload');
+
+  const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
+
+  // Seul le titulaire de la matière dans cette classe peut ouvrir la grille
+  const affectation = await affectationDeLEnseignant(
+    id_enseignant, id_matiere, id_classe, anneeActive.id_annee
+  );
+  if (!affectation) {
+    return c.json({ error: "Vous n'enseignez pas cette matière dans cette classe" }, 403);
+  }
+
+  const sequence = await sequenceDansAnnee(id_sequence, anneeActive.id_annee);
+  if (!sequence) return c.json({ error: "Séquence introuvable pour l'année active" }, 400);
 
   const affectationsEleves = await prisma.affectationEleve.findMany({
     where: { id_classe, id_annee: anneeActive.id_annee },
-    include: { eleve: true }
+    include: { eleve: true },
+    orderBy: { eleve: { nom_complet: 'asc' } }
   });
 
   const eleves = affectationsEleves.map(ae => ae.eleve);
 
   const notesExistantes = await prisma.note.findMany({
     where: {
-      id_matiere,
+      id_affectation_cours: affectation.id_affectation_cours,
       id_sequence,
       id_eleve: { in: eleves.map(e => e.id_eleve) }
     }
@@ -184,7 +265,8 @@ notesApp.get('/notes/grille', async (c) => {
     return {
       id_eleve: eleve.id_eleve,
       nom_complet: eleve.nom_complet,
-      valeur_note: noteTrouvee ? noteTrouvee.valeur_note : null
+      // valeur_note est un Decimal : on le convertit en nombre pour le front
+      valeur_note: noteTrouvee ? Number(noteTrouvee.valeur_note) : null
     };
   });
 
@@ -192,12 +274,13 @@ notesApp.get('/notes/grille', async (c) => {
 });
 
 const saveNotesSchema = z.object({
-  id_matiere: z.number(),
-  id_sequence: z.number(),
+  id_classe: uuid,
+  id_matiere: uuid,
+  id_sequence: uuid,
   notes: z.array(z.object({
-    id_eleve: z.number(),
+    id_eleve: uuid,
     valeur_note: z.number().min(0).max(20)
-  }))
+  })).min(1)
 });
 
 notesApp.post('/notes/sauvegarder', async (c) => {
@@ -206,27 +289,62 @@ notesApp.post('/notes/sauvegarder', async (c) => {
     const validation = saveNotesSchema.safeParse(body);
     if (!validation.success) return c.json({ error: "Données de notes invalides", details: validation.error.format() }, 400);
 
-    const { id_matiere, id_sequence, notes } = validation.data;
+    const { id_classe, id_matiere, id_sequence, notes } = validation.data;
+    const { id_enseignant } = c.get('jwtPayload');
+
+    const anneeActive = await getAnneeActive();
+    if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
+
+    // 1. L'enseignant connecté doit être le titulaire de cette matière dans cette classe
+    const affectation = await affectationDeLEnseignant(
+      id_enseignant, id_matiere, id_classe, anneeActive.id_annee
+    );
+    if (!affectation) {
+      return c.json({ error: "Vous n'êtes pas autorisé à saisir les notes de cette matière dans cette classe" }, 403);
+    }
+
+    // 2. La séquence doit appartenir à l'année active
+    const sequence = await sequenceDansAnnee(id_sequence, anneeActive.id_annee);
+    if (!sequence) return c.json({ error: "Séquence introuvable pour l'année active" }, 400);
+
+    // 3. Tous les élèves doivent appartenir à cette classe pour l'année active
+    const idsEleves = Array.from(new Set(notes.map(n => n.id_eleve)));
+    const elevesDeLaClasse = await prisma.affectationEleve.findMany({
+      where: { id_classe, id_annee: anneeActive.id_annee, id_eleve: { in: idsEleves } },
+      select: { id_eleve: true }
+    });
+    if (elevesDeLaClasse.length !== idsEleves.length) {
+      const valides = new Set(elevesDeLaClasse.map(e => e.id_eleve));
+      return c.json({
+        error: "Certains élèves n'appartiennent pas à cette classe",
+        eleves_invalides: idsEleves.filter(id => !valides.has(id))
+      }, 400);
+    }
+
+    const { id_affectation_cours } = affectation;
 
     await prisma.$transaction(
-      notes.map(item =>
-        prisma.note.upsert({
+      notes.map(item => {
+        // Decimal(5,2) : on arrondit à 2 décimales
+        const valeur_note = Math.round(item.valeur_note * 100) / 100;
+
+        return prisma.note.upsert({
           where: {
-            id_eleve_id_matiere_id_sequence: {
+            id_eleve_id_affectation_cours_id_sequence: {
               id_eleve: item.id_eleve,
-              id_matiere,
+              id_affectation_cours,
               id_sequence
             }
           },
-          update: { valeur_note: item.valeur_note },
+          update: { valeur_note },
           create: {
             id_eleve: item.id_eleve,
-            id_matiere,
+            id_affectation_cours,
             id_sequence,
-            valeur_note: item.valeur_note
+            valeur_note
           }
-        })
-      )
+        });
+      })
     );
 
     return c.json({ success: true, message: "Notes enregistrées avec succès !" });
