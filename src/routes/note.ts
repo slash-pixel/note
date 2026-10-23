@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { PrismaClient } from '@prisma/client';
 import { sign, verify } from 'hono/jwt';
 import { z } from 'zod';
+import bcrypt from 'bcryptjs';
 
 type JwtPayload = {
   id_enseignant: string;
@@ -23,8 +24,6 @@ const uuid = z.string().uuid();
 const getAnneeActive = () =>
   prisma.anneeScolaire.findFirst({ where: { est_active: true } });
 
-// Retourne l'affectation (matière + classe + année) UNIQUEMENT si l'enseignant
-// connecté en est bien le titulaire. Sinon null => accès refusé.
 const affectationDeLEnseignant = async (
   id_enseignant: string,
   id_matiere: string,
@@ -41,7 +40,6 @@ const affectationDeLEnseignant = async (
     : null;
 };
 
-// La séquence appartient-elle bien à l'année active ?
 const sequenceDansAnnee = (id_sequence: string, id_annee: string) =>
   prisma.sequence.findFirst({
     where: { id_sequence, trimestre: { id_annee } }
@@ -67,7 +65,6 @@ notesApp.get('/classes', async (c) => {
   const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
-  // Avec des UUID, trier par id donne un ordre aléatoire : on trie par nom
   const classes = await prisma.classe.findMany({
     orderBy: { nom_classe: 'asc' }
   });
@@ -82,7 +79,6 @@ notesApp.get('/classes/:id_classe/matieres', async (c) => {
   const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
-  // Une matière n'apparaît qu'une fois par classe (contrainte d'unicité)
   const affectations = await prisma.affectationCours.findMany({
     where: { id_classe, id_annee: anneeActive.id_annee },
     include: { matiere: true },
@@ -105,8 +101,6 @@ notesApp.get('/enseignants/filtres', async (c) => {
   const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
-  // Un seul enseignant par matière et par classe : on renvoie une liste
-  // (0 ou 1 élément) pour garder le même format côté front.
   const affectations = await prisma.affectationCours.findMany({
     where: { id_classe, id_matiere, id_annee: anneeActive.id_annee },
     include: { enseignant: true }
@@ -123,7 +117,7 @@ notesApp.get('/enseignants/filtres', async (c) => {
 });
 
 // -----------------------------------------------------------------------------
-// 2. AUTHENTIFICATION DE L'ENSEIGNANT (Texte clair)
+// 2. AUTHENTIFICATION DE L'ENSEIGNANT (Avec bcrypt)
 // -----------------------------------------------------------------------------
 
 const loginSchema = z.object({
@@ -147,7 +141,8 @@ notesApp.post('/auth/login', async (c) => {
       return c.json({ error: "Accès refusé ou enseignant inactif" }, 403);
     }
 
-    const motDePasseValide = (mot_de_passe === enseignant.mot_de_passe);
+    // Vérification du mot de passe haché avec bcrypt
+    const motDePasseValide = await bcrypt.compare(mot_de_passe, enseignant.mot_de_passe);
     if (!motDePasseValide) {
       return c.json({ error: "Mot de passe incorrect" }, 401);
     }
@@ -180,7 +175,6 @@ notesApp.use('/notes/*', async (c, next) => {
     return c.json({ error: "Token manquant ou invalide" }, 401);
   }
 
-  // Nettoie l'en-tête au cas où Scalar concaténerait des chaînes (ex: "Bearer token, Bearer")
   const firstAuth = authHeader.split(',')[0].trim();
 
   if (!firstAuth.startsWith('Bearer ')) {
@@ -206,14 +200,12 @@ notesApp.use('/notes/*', async (c, next) => {
     }, 401);
   }
 
-  // Le token doit bien identifier un enseignant (UUID)
   if (!uuid.safeParse(payload.id_enseignant).success) {
     return c.json({ error: "Token invalide" }, 401);
   }
 
   c.set('jwtPayload', payload as unknown as JwtPayload);
 
-  // Exécuté en dehors du try/catch JWT pour ne pas masquer les erreurs métier/Prisma
   await next();
 });
 
@@ -233,7 +225,6 @@ notesApp.get('/notes/grille', async (c) => {
   const anneeActive = await getAnneeActive();
   if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
-  // Seul le titulaire de la matière dans cette classe peut ouvrir la grille
   const affectation = await affectationDeLEnseignant(
     id_enseignant, id_matiere, id_classe, anneeActive.id_annee
   );
@@ -265,7 +256,6 @@ notesApp.get('/notes/grille', async (c) => {
     return {
       id_eleve: eleve.id_eleve,
       nom_complet: eleve.nom_complet,
-      // valeur_note est un Decimal : on le convertit en nombre pour le front
       valeur_note: noteTrouvee ? Number(noteTrouvee.valeur_note) : null
     };
   });
@@ -295,7 +285,6 @@ notesApp.post('/notes/sauvegarder', async (c) => {
     const anneeActive = await getAnneeActive();
     if (!anneeActive) return c.json({ error: "Aucune année active" }, 400);
 
-    // 1. L'enseignant connecté doit être le titulaire de cette matière dans cette classe
     const affectation = await affectationDeLEnseignant(
       id_enseignant, id_matiere, id_classe, anneeActive.id_annee
     );
@@ -303,11 +292,9 @@ notesApp.post('/notes/sauvegarder', async (c) => {
       return c.json({ error: "Vous n'êtes pas autorisé à saisir les notes de cette matière dans cette classe" }, 403);
     }
 
-    // 2. La séquence doit appartenir à l'année active
     const sequence = await sequenceDansAnnee(id_sequence, anneeActive.id_annee);
     if (!sequence) return c.json({ error: "Séquence introuvable pour l'année active" }, 400);
 
-    // 3. Tous les élèves doivent appartenir à cette classe pour l'année active
     const idsEleves = Array.from(new Set(notes.map(n => n.id_eleve)));
     const elevesDeLaClasse = await prisma.affectationEleve.findMany({
       where: { id_classe, id_annee: anneeActive.id_annee, id_eleve: { in: idsEleves } },
@@ -325,7 +312,6 @@ notesApp.post('/notes/sauvegarder', async (c) => {
 
     await prisma.$transaction(
       notes.map(item => {
-        // Decimal(5,2) : on arrondit à 2 décimales
         const valeur_note = Math.round(item.valeur_note * 100) / 100;
 
         return prisma.note.upsert({
