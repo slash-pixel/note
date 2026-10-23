@@ -141,7 +141,7 @@ notesApp.post('/auth/login', async (c) => {
       return c.json({ error: "Accès refusé ou enseignant inactif" }, 403);
     }
 
-    // Vérification du mot de passe haché avec bcrypt
+    // Comparaison sécurisée avec bcrypt
     const motDePasseValide = await bcrypt.compare(mot_de_passe, enseignant.mot_de_passe);
     if (!motDePasseValide) {
       return c.json({ error: "Mot de passe incorrect" }, 401);
