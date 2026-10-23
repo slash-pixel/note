@@ -117,7 +117,7 @@ notesApp.get('/enseignants/filtres', async (c) => {
 });
 
 // -----------------------------------------------------------------------------
-// 2. AUTHENTIFICATION DE L'ENSEIGNANT (Avec bcrypt)
+// 2. AUTHENTIFICATION DE L'ENSEIGNANT (Universel : Bcrypt ou Texte Clair)
 // -----------------------------------------------------------------------------
 
 const loginSchema = z.object({
@@ -141,8 +141,15 @@ notesApp.post('/auth/login', async (c) => {
       return c.json({ error: "Accès refusé ou enseignant inactif" }, 403);
     }
 
-    // Comparaison sécurisée avec bcrypt
-    const motDePasseValide = await bcrypt.compare(mot_de_passe, enseignant.mot_de_passe);
+    let motDePasseValide = false;
+
+    // Gestion universelle : hachage bcrypt ou texte clair
+    if (enseignant.mot_de_passe.startsWith('$2a$') || enseignant.mot_de_passe.startsWith('$2b$')) {
+      motDePasseValide = await bcrypt.compare(mot_de_passe, enseignant.mot_de_passe);
+    } else {
+      motDePasseValide = (mot_de_passe === enseignant.mot_de_passe);
+    }
+
     if (!motDePasseValide) {
       return c.json({ error: "Mot de passe incorrect" }, 401);
     }
