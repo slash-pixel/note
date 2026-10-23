@@ -2,9 +2,18 @@
 import { Hono } from 'hono';
 import { apiReference } from '@scalar/hono-api-reference';
 import { serve } from '@hono/node-server';
+import { cors } from 'hono/cors';
 import notesApp from './routes/note.js';
 
 const app = new Hono();
+
+// Configuration CORS pour autoriser le frontend à communiquer avec l'API
+app.use('/api/*', cors({
+  origin: (origin) => origin || '*',
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}));
 
 // 0. Route d'accueil
 app.get('/', (c) => {
@@ -37,6 +46,10 @@ app.get('/doc', (c) => {
       {
         url: 'http://localhost:3000',
         description: 'Serveur de développement local',
+      },
+      {
+        url: 'https://note-o1lo.onrender.com',
+        description: 'Serveur de production (Render)',
       },
     ],
     components: {
@@ -79,8 +92,8 @@ app.get('/doc', (c) => {
               name: 'id_classe',
               in: 'path',
               required: true,
-              schema: { type: 'integer' },
-              description: 'ID de la classe',
+              schema: { type: 'string', format: 'uuid' },
+              description: 'ID de la classe (UUID)',
             },
           ],
           responses: {
@@ -98,13 +111,13 @@ app.get('/doc', (c) => {
               name: 'id_classe',
               in: 'query',
               required: true,
-              schema: { type: 'integer' },
+              schema: { type: 'string', format: 'uuid' },
             },
             {
               name: 'id_matiere',
               in: 'query',
               required: true,
-              schema: { type: 'integer' },
+              schema: { type: 'string', format: 'uuid' },
             },
           ],
           responses: {
@@ -124,8 +137,8 @@ app.get('/doc', (c) => {
                 schema: {
                   type: 'object',
                   properties: {
-                    id_enseignant: { type: 'integer', example: 1 },
-                    mot_de_passe: { type: 'string', example: 'password123' },
+                    id_enseignant: { type: 'string', format: 'uuid', example: 'uuid-enseignant' },
+                    mot_de_passe: { type: 'string', example: 'Borromee2026' },
                   },
                   required: ['id_enseignant', 'mot_de_passe'],
                 },
@@ -146,9 +159,9 @@ app.get('/doc', (c) => {
           tags: ['Notes'],
           security: [{ BearerAuth: [] }],
           parameters: [
-            { name: 'id_classe', in: 'query', required: true, schema: { type: 'integer' } },
-            { name: 'id_matiere', in: 'query', required: true, schema: { type: 'integer' } },
-            { name: 'id_sequence', in: 'query', required: true, schema: { type: 'integer' } },
+            { name: 'id_classe', in: 'query', required: true, schema: { type: 'string', format: 'uuid' } },
+            { name: 'id_matiere', in: 'query', required: true, schema: { type: 'string', format: 'uuid' } },
+            { name: 'id_sequence', in: 'query', required: true, schema: { type: 'string', format: 'uuid' } },
           ],
           responses: {
             '200': { description: 'Grille des élèves avec leurs notes existantes' },
@@ -169,21 +182,22 @@ app.get('/doc', (c) => {
                 schema: {
                   type: 'object',
                   properties: {
-                    id_matiere: { type: 'integer', example: 1 },
-                    id_sequence: { type: 'integer', example: 1 },
+                    id_classe: { type: 'string', format: 'uuid' },
+                    id_matiere: { type: 'string', format: 'uuid' },
+                    id_sequence: { type: 'string', format: 'uuid' },
                     notes: {
                       type: 'array',
                       items: {
                         type: 'object',
                         properties: {
-                          id_eleve: { type: 'integer', example: 1 },
+                          id_eleve: { type: 'string', format: 'uuid' },
                           valeur_note: { type: 'number', example: 15.5 },
                         },
                         required: ['id_eleve', 'valeur_note'],
                       },
                     },
                   },
-                  required: ['id_matiere', 'id_sequence', 'notes'],
+                  required: ['id_classe', 'id_matiere', 'id_sequence', 'notes'],
                 },
               },
             },
