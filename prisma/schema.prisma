@@ -1,3 +1,4 @@
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -30,6 +31,7 @@ model Trimestre {
   annee AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Restrict)
 
   sequences Sequence[]
+  resultats  ResultatTrimestriel[]
 
   @@unique([id_annee, numero_trimestre])
 }
@@ -41,7 +43,8 @@ model Sequence {
 
   trimestre Trimestre @relation(fields: [id_trimestre], references: [id_trimestre], onDelete: Restrict)
 
-  notes Note[]
+  notes         Note[]
+  verrouillages VerrouillageNote[]
 
   @@unique([id_trimestre, numero_sequence])
 }
@@ -63,8 +66,9 @@ model Eleve {
   nom_complet String
   est_actif   Boolean @default(true)
 
-  classes AffectationEleve[]
-  notes   Note[]
+  classes    AffectationEleve[]
+  notes      Note[]
+  resultats  ResultatTrimestriel[]
 }
 
 model Matiere {
@@ -84,7 +88,20 @@ model Enseignant {
 }
 
 // --------------------------------------------------
-// 3. AFFECTATION DES ÉLÈVES
+// 3. ADMINISTRATION
+// --------------------------------------------------
+
+model Administrateur {
+  id_admin     String  @id @default(uuid()) @db.Uuid
+  nom_complet  String
+  mot_de_passe String
+  est_actif    Boolean @default(true)
+
+  verrouillages VerrouillageNote[]
+}
+
+// --------------------------------------------------
+// 4. AFFECTATION DES ÉLÈVES
 // --------------------------------------------------
 
 model AffectationEleve {
@@ -108,7 +125,7 @@ model AffectationEleve {
 }
 
 // --------------------------------------------------
-// 4. AFFECTATION DES COURS
+// 5. AFFECTATION DES COURS
 // --------------------------------------------------
 
 model AffectationCours {
@@ -119,6 +136,9 @@ model AffectationCours {
   id_classe     String @db.Uuid
   id_annee      String @db.Uuid
 
+  // Coefficient propre à la matière dans cette classe.
+  coefficient Decimal @default(1) @db.Decimal(5, 2)
+
   enseignant Enseignant @relation(fields: [id_enseignant], references: [id_enseignant], onDelete: Restrict)
 
   matiere Matiere @relation(fields: [id_matiere], references: [id_matiere], onDelete: Restrict)
@@ -127,7 +147,9 @@ model AffectationCours {
 
   annee AnneeScolaire @relation(fields: [id_annee], references: [id_annee], onDelete: Restrict)
 
-  notes Note[]
+  notes         Note[]
+  verrouillages VerrouillageNote[]
+  resultats     ResultatTrimestriel[]
 
   // Une matière possède un seul enseignant
   // par classe et par année scolaire.
@@ -138,7 +160,7 @@ model AffectationCours {
 }
 
 // --------------------------------------------------
-// 5. GESTION DES NOTES
+// 6. GESTION DES NOTES PAR SÉQUENCE
 // --------------------------------------------------
 
 model Note {
@@ -148,7 +170,11 @@ model Note {
   id_affectation_cours String @db.Uuid
   id_sequence          String @db.Uuid
 
+  // Note obtenue par l'élève.
   valeur_note Decimal @db.Decimal(5, 2)
+
+  // NxC = valeur_note × coefficient du cours.
+  note_x_coefficient Decimal @db.Decimal(10, 2)
 
   eleve Eleve @relation(fields: [id_eleve], references: [id_eleve], onDelete: Restrict)
 
@@ -161,4 +187,63 @@ model Note {
   @@unique([id_eleve, id_affectation_cours, id_sequence])
   @@index([id_sequence])
   @@index([id_affectation_cours])
+}
+
+// --------------------------------------------------
+// 7. RÉSULTATS TRIMESTRIELS
+// --------------------------------------------------
+
+model ResultatTrimestriel {
+  id_resultat String @id @default(uuid()) @db.Uuid
+
+  id_eleve             String @db.Uuid
+  id_affectation_cours String @db.Uuid
+  id_trimestre         String @db.Uuid
+
+  // Addition des notes des deux séquences.
+  somme_notes Decimal @db.Decimal(10, 2)
+
+  // Moyenne des deux séquences.
+  moyenne_trimestrielle Decimal @db.Decimal(5, 2)
+
+  // Moyenne trimestrielle multipliée par le coefficient.
+  moyenne_x_coefficient Decimal @db.Decimal(10, 2)
+
+  eleve Eleve @relation(fields: [id_eleve], references: [id_eleve], onDelete: Restrict)
+
+  affectationCours AffectationCours @relation(fields: [id_affectation_cours], references: [id_affectation_cours], onDelete: Restrict)
+
+  trimestre Trimestre @relation(fields: [id_trimestre], references: [id_trimestre], onDelete: Restrict)
+
+  // Un résultat trimestriel par élève et par cours.
+
+  @@unique([id_eleve, id_affectation_cours, id_trimestre])
+  @@index([id_trimestre])
+  @@index([id_affectation_cours])
+}
+
+// --------------------------------------------------
+// 8. GESTION DU VERROUILLAGE DES NOTES
+// --------------------------------------------------
+
+model VerrouillageNote {
+  id_verrouillage      String  @id @default(uuid()) @db.Uuid
+  id_affectation_cours String  @db.Uuid
+  id_sequence          String  @db.Uuid
+  id_admin             String? @db.Uuid
+
+  est_verrouille Boolean @default(false)
+
+  // Date du dernier verrouillage.
+  date_verrouillage DateTime?
+
+  affectationCours AffectationCours @relation(fields: [id_affectation_cours], references: [id_affectation_cours], onDelete: Restrict)
+
+  sequence Sequence @relation(fields: [id_sequence], references: [id_sequence], onDelete: Restrict)
+
+  administrateur Administrateur? @relation(fields: [id_admin], references: [id_admin], onDelete: Restrict)
+
+  @@unique([id_affectation_cours, id_sequence])
+  @@index([id_sequence])
+  @@index([id_admin])
 }
