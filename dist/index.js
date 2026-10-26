@@ -1,202 +1,78 @@
+// src/index.ts — compatible avec src/routes/note.ts (ou notes.ts)
+import 'dotenv/config';
 import { Hono } from 'hono';
-import { PrismaClient } from '@prisma/client';
-import bcrypt from 'bcrypt';
-import { sign, verify } from 'hono/jwt';
-import { z } from 'zod';
-import { Scalar } from '@scalar/hono-api-reference';
-const prisma = new PrismaClient();
+import { apiReference } from '@scalar/hono-api-reference';
+import { serve } from '@hono/node-server';
+import { cors } from 'hono/cors';
+import notesApp from './routes/notes.js';
 const app = new Hono();
-const JWT_SECRET = process.env.JWT_SECRET || 'cle-secrete-super-securisee';
-// -----------------------------------------------------------------------------
-// 1. ENDPOINTS POUR LE FORMULAIRE DE CONNEXION (Listes dynamiques)
-// -----------------------------------------------------------------------------
-app.get('/api/trimestres', async (c) => {
-    const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
-    if (!anneeActive)
-        return c.json({ error: "Aucune année active" }, 400);
-    const trimestres = await prisma.trimestre.findMany({
-        where: { id_annee: anneeActive.id_annee },
-        include: { sequences: true }
-    });
-    return c.json(trimestres);
-});
-app.get('/api/classes', async (c) => {
-    const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
-    if (!anneeActive)
-        return c.json({ error: "Aucune année active" }, 400);
-    const classes = await prisma.classe.findMany({
-        where: {
-            eleves: { some: { id_annee: anneeActive.id_annee } }
-        }
-    });
-    return c.json(classes);
-});
-app.get('/api/classes/:id_classe/matieres', async (c) => {
-    const id_classe = Number(c.req.param('id_classe'));
-    const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
-    if (!anneeActive)
-        return c.json({ error: "Aucune année active" }, 400);
-    const affectations = await prisma.affectationCours.findMany({
-        where: { id_classe, id_annee: anneeActive.id_annee },
-        include: { matiere: true }
-    });
-    const matieres = Array.from(new Set(affectations.map(a => JSON.stringify(a.matiere)))).map(m => JSON.parse(m));
-    return c.json(matieres);
-});
-app.get('/api/enseignants/filtres', async (c) => {
-    const id_classe = Number(c.req.query('id_classe'));
-    const id_matiere = Number(c.req.query('id_matiere'));
-    const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
-    if (!anneeActive)
-        return c.json({ error: "Aucune année active" }, 400);
-    const affectations = await prisma.affectationCours.findMany({
-        where: { id_classe, id_matiere, id_annee: anneeActive.id_annee },
-        include: { enseignant: true }
-    });
-    const enseignants = affectations.map(a => ({
-        id_enseignant: a.enseignant.id_enseignant,
-        nom_complet: a.enseignant.nom_complet
-    }));
-    return c.json(enseignants);
-});
-// -----------------------------------------------------------------------------
-// 2. AUTHENTIFICATION SÉCURISÉE DE L'ENSEIGNANT
-// -----------------------------------------------------------------------------
-const loginSchema = z.object({
-    id_enseignant: z.number(),
-    mot_de_passe: z.string().min(1)
-});
-app.post('/api/auth/login', async (c) => {
-    try {
-        const body = await c.req.json();
-        const validation = loginSchema.safeParse(body);
-        if (!validation.success)
-            return c.json({ error: "Données invalides" }, 400);
-        const { id_enseignant, mot_de_passe } = validation.data;
-        const enseignant = await prisma.enseignant.findUnique({
-            where: { id_enseignant }
-        });
-        if (!enseignant || !enseignant.est_actif) {
-            return c.json({ error: "Accès refusé ou enseignant inactif" }, 403);
-        }
-        const motDePasseValide = await bcrypt.compare(mot_de_passe, enseignant.mot_de_passe);
-        if (!motDePasseValide) {
-            return c.json({ error: "Mot de passe incorrect" }, 401);
-        }
-        const payload = {
-            id_enseignant: enseignant.id_enseignant,
-            nom_complet: enseignant.nom_complet,
-            exp: Math.floor(Date.now() / 1000) + 60 * 60 * 4
-        };
-        // Génération du token avec les 3 arguments requis (payload, secret, algorithme)
-        const token = await sign(payload, JWT_SECRET, 'HS256');
-        return c.json({ token, message: "Connexion réussie" });
-    }
-    catch (error) {
-        return c.json({ error: "Erreur interne du serveur" }, 500);
-    }
-});
-// -----------------------------------------------------------------------------
-// 3. ESPACE DE SAISIE DES NOTES (Sécurisé par JWT)
-// -----------------------------------------------------------------------------
-app.use('/api/notes/*', async (c, next) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return c.json({ error: "Token manquant ou invalide" }, 401);
-    }
-    const token = authHeader.split(' ')[1];
-    try {
-        // Correction ici : on vérifie le token existant avec verify() au lieu de le signer à nouveau
-        const payload = await verify(token, JWT_SECRET, 'HS256');
-        c.set('jwtPayload', payload);
-        await next();
-    }
-    catch (e) {
-        return c.json({ error: "Session expirée ou non autorisée" }, 401);
-    }
-});
-app.get('/api/notes/grille', async (c) => {
-    const id_classe = Number(c.req.query('id_classe'));
-    const id_matiere = Number(c.req.query('id_matiere'));
-    const id_sequence = Number(c.req.query('id_sequence'));
-    const anneeActive = await prisma.anneeScolaire.findFirst({ where: { est_active: true } });
-    if (!anneeActive)
-        return c.json({ error: "Aucune année active" }, 400);
-    const affectationsEleves = await prisma.affectationEleve.findMany({
-        where: { id_classe, id_annee: anneeActive.id_annee },
-        include: { eleve: true }
-    });
-    const eleves = affectationsEleves.map(ae => ae.eleve);
-    const notesExistantes = await prisma.note.findMany({
-        where: {
-            id_matiere,
-            id_sequence,
-            id_eleve: { in: eleves.map(e => e.id_eleve) }
-        }
-    });
-    const grille = eleves.map(eleve => {
-        const noteTrouvee = notesExistantes.find(n => n.id_eleve === eleve.id_eleve);
-        return {
-            id_eleve: eleve.id_eleve,
-            nom_complet: eleve.nom_complet,
-            valeur_note: noteTrouvee ? noteTrouvee.valeur_note : null
-        };
-    });
-    return c.json(grille);
-});
-const saveNotesSchema = z.object({
-    id_matiere: z.number(),
-    id_sequence: z.number(),
-    notes: z.array(z.object({
-        id_eleve: z.number(),
-        valeur_note: z.number().min(0).max(20)
-    }))
-});
-app.post('/api/notes/sauvegarder', async (c) => {
-    try {
-        const body = await c.req.json();
-        const validation = saveNotesSchema.safeParse(body);
-        if (!validation.success)
-            return c.json({ error: "Données de notes invalides", details: validation.error.format() }, 400);
-        const { id_matiere, id_sequence, notes } = validation.data;
-        await prisma.$transaction(notes.map(item => prisma.note.upsert({
-            where: {
-                id_eleve_id_matiere_id_sequence: {
-                    id_eleve: item.id_eleve,
-                    id_matiere,
-                    id_sequence
-                }
-            },
-            update: { valeur_note: item.valeur_note },
-            create: {
-                id_eleve: item.id_eleve,
-                id_matiere,
-                id_sequence,
-                valeur_note: item.valeur_note
-            }
-        })));
-        return c.json({ success: true, message: "Notes enregistrées avec succès !" });
-    }
-    catch (error) {
-        return c.json({ error: "Erreur lors de l'enregistrement des notes" }, 500);
-    }
-});
-// -----------------------------------------------------------------------------
-// 4. DOCUMENTATION INTERACTIVE (Scalar / Swagger)
-// -----------------------------------------------------------------------------
-app.get('/reference', Scalar({
-    url: '/doc',
-    pageTitle: 'Documentation API Scolaire',
-    theme: 'purple',
+// CORS : avec credentials=true, autoriser explicitement les origines du frontend.
+// Exemple FRONTEND_ORIGINS=http://localhost:5173,https://mon-frontend.example
+const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? 'http://localhost:5173,http://localhost:3000')
+    .split(',').map(value => value.trim()).filter(Boolean);
+app.use('/api/*', cors({
+    origin: origin => allowedOrigins.includes(origin) ? origin : '',
+    allowMethods: ['GET', 'POST', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
 }));
-app.get('/doc', (c) => {
-    return c.json({
-        openapi: '3.1.0',
-        info: {
-            title: 'API Gestion Scolaire - Notes & Séquences',
-            version: '1.0.0',
-        },
-        paths: {},
-    });
+app.get('/', c => c.json({ success: true, message: 'API de gestion scolaire active' }));
+app.route('/api', notesApp);
+const uuid = { type: 'string', format: 'uuid' };
+const param = (name, where = 'query') => ({ name, in: where, required: true, schema: uuid });
+const jsonBody = (schema) => ({ required: true, content: { 'application/json': { schema } } });
+const response = (description) => ({ description });
+const auth = [{ BearerAuth: [] }];
+const targetProperties = { id_classe: uuid, id_matiere: uuid, id_sequence: uuid };
+const targetBody = jsonBody({ type: 'object', properties: targetProperties, required: Object.keys(targetProperties) });
+const targetParams = [param('id_classe'), param('id_matiere'), param('id_sequence')];
+const restricted = { '400': response('Paramètres invalides ou année inactive'), '401': response('Token manquant ou invalide'), '403': response('Accès refusé'), '404': response('Ressource introuvable') };
+const loginBody = jsonBody({
+    type: 'object',
+    properties: { id: uuid, mot_de_passe: { type: 'string', format: 'password' } },
+    required: ['id', 'mot_de_passe'],
 });
-export default app;
+app.get('/doc', c => c.json({
+    openapi: '3.1.0',
+    info: {
+        title: 'API Gestion Scolaire — Notes, NxC et Verrouillages',
+        version: '2.0.0',
+        description: 'Contrat des routes exposées par src/routes/note.ts. La validation verrouille les notes, tandis que l’administration peut rouvrir la saisie.',
+    },
+    servers: [
+        { url: 'http://localhost:3000', description: 'Développement local' },
+        { url: 'https://note-o1lo.onrender.com', description: 'Production (si ce déploiement est toujours utilisé)' },
+    ],
+    components: {
+        securitySchemes: { BearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } },
+        schemas: {
+            NoteInput: { type: 'object', properties: { id_eleve: uuid, valeur_note: { type: 'number', minimum: 0, maximum: 20, example: 15.5 } }, required: ['id_eleve', 'valeur_note'] },
+            LigneGrille: { type: 'object', properties: { id_eleve: uuid, nom_complet: { type: 'string' }, valeur_note: { type: ['number', 'null'] }, note_x_coefficient: { type: ['number', 'null'] } } },
+        },
+    },
+    tags: [
+        { name: 'Configuration' }, { name: 'Authentification' }, { name: 'Notes' },
+        { name: 'Résultats trimestriels' }, { name: 'Administration' },
+    ],
+    paths: {
+        '/api/trimestres': { get: { tags: ['Configuration'], summary: 'Trimestres et séquences de l’année active', responses: { '200': response('Liste des trimestres'), '400': response('Aucune année active') } } },
+        '/api/sequences': { get: { tags: ['Configuration'], summary: 'Séquences regroupées par trimestre', responses: { '200': response('Trimestres, libellés et séquences'), '400': response('Aucune année active') } } },
+        '/api/classes': { get: { tags: ['Configuration'], summary: 'Classes ayant une affectation de cours pour l’année active', responses: { '200': response('Liste des classes'), '400': response('Aucune année active') } } },
+        '/api/classes/{id_classe}/matieres': { get: { tags: ['Configuration'], summary: 'Matières et coefficients propres à une classe', parameters: [param('id_classe', 'path')], responses: { '200': response('Matières, id_affectation_cours et coefficient'), '400': response('Classe invalide ou aucune année active') } } },
+        '/api/enseignants/filtres': { get: { tags: ['Configuration'], summary: 'Enseignant actif affecté à une matière dans une classe', parameters: [param('id_classe'), param('id_matiere')], responses: { '200': response('Liste avec identifiant et nom de l’enseignant'), '400': response('Paramètres invalides') } } },
+        '/api/auth/login': { post: { tags: ['Authentification'], summary: 'Connexion enseignant (mot de passe bcrypt)', description: 'Le corps attend « id » : UUID de l’enseignant, et non « id_enseignant ».', requestBody: loginBody, responses: { '200': response('Token, rôle enseignant et nom complet'), '400': response('Corps invalide'), '401': response('Identifiants incorrects ou compte inactif') } } },
+        '/api/admin/auth/login': { post: { tags: ['Authentification'], summary: 'Connexion administrateur (mot de passe bcrypt)', description: 'Le champ « id » contient l’UUID de l’administrateur.', requestBody: loginBody, responses: { '200': response('Token, rôle admin et nom complet'), '400': response('Corps invalide'), '401': response('Identifiants incorrects ou compte inactif') } } },
+        '/api/notes/grille': { get: { tags: ['Notes'], summary: 'Grille de saisie ou consultation selon le verrouillage', security: auth, parameters: targetParams, responses: { '200': { description: 'Coefficient, est_verrouille, mode, date_verrouillage et grille avec note/NxC', content: { 'application/json': { schema: { type: 'object', properties: { id_affectation_cours: uuid, id_sequence: uuid, coefficient: { type: 'number' }, est_verrouille: { type: 'boolean' }, date_verrouillage: { type: ['string', 'null'], format: 'date-time' }, mode: { type: 'string', enum: ['saisie', 'lecture_seule'] }, grille: { type: 'array', items: { $ref: '#/components/schemas/LigneGrille' } } } } } } }, ...restricted } } },
+        '/api/notes/consultation': { get: { tags: ['Notes'], summary: 'Consulter notes et NxC en lecture seule', description: 'Renvoie les mêmes données que /api/notes/grille. Le frontend doit désactiver les champs si est_verrouille=true.', security: auth, parameters: targetParams, responses: { '200': response('Grille avec état du verrouillage'), ...restricted } } },
+        '/api/notes/sauvegarder': { post: { tags: ['Notes'], summary: 'Enregistrer un brouillon et calculer automatiquement NxC', description: 'Refusé après validation définitive. Les notes doivent correspondre à des élèves de la classe.', security: auth, requestBody: jsonBody({ type: 'object', properties: { ...targetProperties, notes: { type: 'array', minItems: 1, items: { $ref: '#/components/schemas/NoteInput' } } }, required: [...Object.keys(targetProperties), 'notes'] }), responses: { '200': response('Brouillon enregistré'), ...restricted, '409': response('Notes verrouillées') } } },
+        '/api/notes/valider': { post: { tags: ['Notes'], summary: 'Valider définitivement et verrouiller la saisie', description: 'Chaque élève inscrit doit posséder une note. Cette opération est distincte de la sauvegarde.', security: auth, requestBody: targetBody, responses: { '200': response('Notes validées et verrouillées'), ...restricted, '409': response('Notes incomplètes, classe vide ou déjà verrouillée') } } },
+        '/api/notes/resultats-trimestriels': { get: { tags: ['Résultats trimestriels'], summary: 'Afficher somme S1+S2, moyenne et moyenne × coefficient', security: auth, parameters: [param('id_classe'), param('id_matiere'), param('id_trimestre')], responses: { '200': response('Coefficient et résultats des élèves (null tant que les deux notes ne sont pas disponibles)'), ...restricted } } },
+        '/api/notes/admin/verrouillages': { get: { tags: ['Administration'], summary: 'Lister les verrouillages de l’année active', security: auth, responses: { '200': response('Liste enrichie avec classe, matière, enseignant, séquence et administrateur'), '401': response('Token invalide'), '403': response('Réservé aux administrateurs') } } },
+        '/api/notes/admin/deverrouiller': { post: { tags: ['Administration'], summary: 'Rouvrir la saisie d’un cours pour une séquence', security: auth, requestBody: jsonBody({ type: 'object', properties: { id_affectation_cours: uuid, id_sequence: uuid }, required: ['id_affectation_cours', 'id_sequence'] }), responses: { '200': response('Saisie rouverte'), ...restricted } } },
+    },
+}));
+app.get('/reference', apiReference({ url: '/doc', pageTitle: 'Documentation API scolaire — Notes', theme: 'purple' }));
+const port = Number(process.env.PORT) || 3000;
+serve({ fetch: app.fetch, port });
+console.log(`🚀 API : http://localhost:${port}`);
+console.log(`📚 Documentation : http://localhost:${port}/reference`);
