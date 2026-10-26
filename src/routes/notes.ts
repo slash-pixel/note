@@ -9,7 +9,70 @@ const app = new Hono<{ Variables: { actor: { id: string; role: 'enseignant' | 'a
 const secret = process.env.JWT_SECRET;
 if (!secret || secret.length < 32) throw new Error('JWT_SECRET doit contenir au moins 32 caractères');
 const uuid = z.string().uuid();
-const authSchema = z.object({ id: uuid, mot_de_passe: z.string().min(1) });
+
+
+async function login(
+  c: any,
+  role: 'enseignant' | 'admin'
+) {
+  const body = authSchema.safeParse(
+    await c.req.json().catch(() => null)
+  );
+
+  if (!body.success) {
+    return error(c, 'Données de connexion invalides', 400);
+  }
+
+  const { id_enseignant, id_admin, mot_de_passe } = body.data;
+
+  const id = role === 'admin'
+    ? id_admin
+    : id_enseignant;
+
+  if (!id) {
+    return error(c, 'Identifiant manquant', 400);
+  }
+
+  const person = role === 'admin'
+    ? await prisma.administrateur.findUnique({
+        where: { id_admin: id }
+      })
+    : await prisma.enseignant.findUnique({
+        where: { id_enseignant: id }
+      });
+
+  if (!person || !person.est_actif) {
+    return error(c, 'Identifiants incorrects ou compte inactif', 401);
+  }
+
+  const passwordValid = await bcrypt.compare(
+    mot_de_passe,
+    person.mot_de_passe
+  );
+
+  if (!passwordValid) {
+    return error(c, 'Identifiants incorrects', 401);
+  }
+
+  const token = await sign(
+    {
+      sub: id,
+      role,
+      exp: Math.floor(Date.now() / 1000) + 4 * 3600
+    },
+    secret!,
+    'HS256'
+  );
+
+  return c.json({
+    token,
+    role,
+    nom_complet: person.nom_complet,
+    message: 'Connexion réussie'
+  });
+}
+
+
 const targetSchema = z.object({ id_classe: uuid, id_matiere: uuid, id_sequence: uuid });
 const notesSchema = targetSchema.extend({
   notes: z.array(z.object({ id_eleve: uuid, valeur_note: z.number().finite().min(0).max(20) })).min(1)
@@ -55,11 +118,26 @@ app.get('/sequences', async c => {
   const trimestres = await prisma.trimestre.findMany({ where: { id_annee: year.id_annee }, orderBy: { numero_trimestre: 'asc' }, include: { sequences: { orderBy: { numero_sequence: 'asc' } } } });
   return c.json(trimestres.map(t => ({ id_trimestre: t.id_trimestre, numero_trimestre: t.numero_trimestre, libelle_trimestre: `Trimestre ${t.numero_trimestre}`, sequences: t.sequences.map(s => ({ id_sequence: s.id_sequence, numero_sequence: s.numero_sequence, libelle_sequence: `Séquence ${s.numero_sequence}` })) })));
 });
-app.get('/classes', async c => {
-  const year = await activeYear();
-  if (!year) return error(c, 'Aucune année active');
-  return c.json(await prisma.classe.findMany({ where: { affectations: { some: { id_annee: year.id_annee } } }, orderBy: { nom_classe: 'asc' } }));
+
+app.get('/classes', async (c) => {
+  const anneeActive = await activeYear();
+
+  if (!anneeActive) {
+    return c.json(
+      { error: 'Aucune année scolaire active' },
+      400
+    );
+  }
+
+  const classes = await prisma.classe.findMany({
+    orderBy: {
+      nom_classe: 'asc'
+    }
+  });
+
+  return c.json(classes);
 });
+
 app.get('/classes/:id_classe/matieres', async c => {
   const id = uuid.safeParse(c.req.param('id_classe'));
   if (!id.success) return error(c, 'Classe invalide');
