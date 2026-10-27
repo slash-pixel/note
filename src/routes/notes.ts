@@ -162,7 +162,7 @@ app.post('/notes/sauvegarder', async c => {
   try {
     await prisma.$transaction(async tx => {
       // A transaction-level advisory lock serializes saves/finalization for the same course and sequence.
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), hashtext(${s.id_sequence}))`;
+await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), hashtext(${s.id_sequence}))`;
       const lock = await tx.verrouillageNote.findUnique({ where: { id_affectation_cours_id_sequence: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } } });
       if (lock?.est_verrouille) throw new Error('LOCKED');
       const enrolled = await tx.affectationEleve.findMany({ where: { id_classe: a.id_classe, id_annee: year.id_annee, id_eleve: { in: ids } }, select: { id_eleve: true } });
@@ -195,7 +195,7 @@ app.post('/notes/valider', async c => {
   const { a, s, year } = target;
   try {
     const result = await prisma.$transaction(async tx => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), hashtext(${s.id_sequence}))`;
+await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), hashtext(${s.id_sequence}))`;
       const enrolled = await tx.affectationEleve.findMany({ where: { id_classe: a.id_classe, id_annee: year.id_annee }, select: { id_eleve: true } });
       if (!enrolled.length) throw new Error('EMPTY_CLASS');
       const grades = await tx.note.findMany({ where: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence, id_eleve: { in: enrolled.map(e => e.id_eleve) } }, select: { id_eleve: true } });
@@ -232,7 +232,7 @@ app.post('/notes/admin/deverrouiller', async c => {
   ]);
   if (!a || !s) return error(c, 'Cours ou séquence introuvable', 404);
   const lock = await prisma.$transaction(async tx => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${id_affectation_cours}), hashtext(${id_sequence}))`;
+await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${id_affectation_cours}), hashtext(${id_sequence}))`;
     return tx.verrouillageNote.upsert({
       where: { id_affectation_cours_id_sequence: { id_affectation_cours, id_sequence } },
       update: { est_verrouille: false, date_verrouillage: null, id_admin: c.get('actor').id },
