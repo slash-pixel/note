@@ -1,8 +1,15 @@
 import { Hono } from 'hono';
 import { Prisma, PrismaClient } from '@prisma/client';
+   import ExcelJS from 'exceljs';
+   import { createHash, timingSafeEqual } from 'node:crypto';
 import { sign, verify } from 'hono/jwt';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
+
+
+
+
+
 
 const prisma = new PrismaClient();
 const app = new Hono<{ Variables: { actor: { id: string; role: 'enseignant' | 'admin' } } }>();
@@ -272,5 +279,298 @@ app.get('/notes/resultats-trimestriels', async c => {
     return { id_eleve: eleve.id_eleve, nom_complet: eleve.nom_complet, somme_notes: r ? num(r.somme_notes) : null, moyenne_trimestrielle: r ? num(r.moyenne_trimestrielle) : null, moyenne_x_coefficient: r ? num(r.moyenne_x_coefficient) : null };
   }) });
 });
+
+
+// ============================================================================
+// À COLLER dans src/routes/notes.ts, juste AVANT la ligne « export default app; »
+//
+// 1) En haut de notes.ts, ajouter les imports :
+//      import ExcelJS from 'exceljs';
+//      import { createHash, timingSafeEqual } from 'node:crypto';
+// 2) Installer la dépendance :
+//      npm install exceljs
+// 3) Sur Render (Environment), créer la variable :
+//      DASHBOARD_PASSWORD = le mot de passe de votre choix (8 caractères minimum)
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Accès au dashboard : un simple mot de passe partagé (DASHBOARD_PASSWORD)
+// ---------------------------------------------------------------------------
+const dashboardPassword = process.env.DASHBOARD_PASSWORD;
+const safeEqual = (a: string, b: string) =>
+  timingSafeEqual(createHash('sha256').update(a).digest(), createHash('sha256').update(b).digest());
+
+// Limite les essais : 8 erreurs par 15 minutes et par adresse IP
+const attempts = new Map<string, { count: number; resetAt: number }>();
+const clientIp = (c: any) => String(c.req.header('x-forwarded-for') || 'local').split(',')[0].trim();
+
+app.post('/dashboard/login', async c => {
+  if (!dashboardPassword || dashboardPassword.length < 8) {
+    return c.json({ error: 'Accès au tableau de bord non configuré sur le serveur' }, 503);
+  }
+  const ip = clientIp(c);
+  const now = Date.now();
+  const entry = attempts.get(ip);
+  const active = entry && entry.resetAt > now ? entry : null;
+  if (active && active.count >= 8) {
+    return c.json({ error: 'Trop de tentatives. Réessayez dans quelques minutes.' }, 429);
+  }
+
+  const body = z.object({ mot_de_passe: z.string().min(1) }).safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return error(c, 'Mot de passe requis');
+
+  if (!safeEqual(body.data.mot_de_passe, dashboardPassword)) {
+    attempts.set(ip, active ? { ...active, count: active.count + 1 } : { count: 1, resetAt: now + 15 * 60 * 1000 });
+    return error(c, 'Mot de passe incorrect', 401);
+  }
+  attempts.delete(ip);
+  const token = await sign({ role: 'dashboard', exp: Math.floor(now / 1000) + 4 * 3600 }, secret!, 'HS256');
+  return c.json({ token });
+});
+
+// Toutes les autres routes /dashboard/* exigent ce jeton (enseignants exclus)
+app.use('/dashboard/*', async (c, next) => {
+  const header = c.req.header('Authorization') || '';
+  if (!/^Bearer \S+$/.test(header)) return error(c, 'Token manquant', 401);
+  try {
+    const p = await verify(header.slice(7), secret!, 'HS256');
+    if (p.role !== 'dashboard') return error(c, 'Token invalide', 401);
+  } catch {
+    return error(c, 'Session expirée ou invalide', 401);
+  }
+  await next();
+});
+
+// ---------------------------------------------------------------------------
+// NOMENCLATURE DES FICHIERS (le seul endroit à modifier pour changer le nom)
+// Exemple : NOTES_2026-2027_6EME-M-1_MATHEMATIQUES_T1-S1_VALIDE.xlsx
+// ---------------------------------------------------------------------------
+const slug = (v: string) =>
+  v
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toUpperCase();
+
+const buildFileName = (p: {
+  annee: string;
+  classe: string;
+  matiere: string;
+  trimestre: number;
+  sequence: number;
+  verrouille: boolean;
+}) =>
+  `NOTES_${slug(p.annee)}_${slug(p.classe)}_${slug(p.matiere)}_T${p.trimestre}-S${p.sequence}_${p.verrouille ? 'VALIDE' : 'BROUILLON'}.xlsx`;
+
+// ---------------------------------------------------------------------------
+// Dashboard : tous les fichiers de notes enregistrés (brouillon) ou verrouillés
+// ---------------------------------------------------------------------------
+app.get('/dashboard/liste', async c => {
+  const year = await activeYear();
+  if (!year) return error(c, 'Aucune année active');
+
+  const sequences = await prisma.sequence.findMany({
+    where: { trimestre: { id_annee: year.id_annee } },
+    include: { trimestre: true }
+  });
+  const seqById = new Map(sequences.map(s => [s.id_sequence, s]));
+  const seqIds = sequences.map(s => s.id_sequence);
+
+  const [noteGroups, locks, effectifs] = await Promise.all([
+    prisma.note.groupBy({
+      by: ['id_affectation_cours', 'id_sequence'],
+      where: { id_sequence: { in: seqIds } },
+      _count: { _all: true }
+    }),
+    prisma.verrouillageNote.findMany({ where: { id_sequence: { in: seqIds } } }),
+    prisma.affectationEleve.groupBy({
+      by: ['id_classe'],
+      where: { id_annee: year.id_annee },
+      _count: { _all: true }
+    })
+  ]);
+
+  const key = (cours: string, seq: string) => `${cours}|${seq}`;
+  const counts = new Map(noteGroups.map(g => [key(g.id_affectation_cours, g.id_sequence), g._count._all]));
+  const lockMap = new Map(locks.filter(l => l.est_verrouille).map(l => [key(l.id_affectation_cours, l.id_sequence), l]));
+  const keys = new Set<string>([...counts.keys(), ...lockMap.keys()]);
+  const courseIds = [...new Set([...keys].map(k => k.split('|')[0]))];
+
+  const courses = await prisma.affectationCours.findMany({
+    where: { id_affectation_cours: { in: courseIds }, id_annee: year.id_annee },
+    include: { classe: true, matiere: true, enseignant: { select: { nom_complet: true } } }
+  });
+  const courseById = new Map(courses.map(a => [a.id_affectation_cours, a]));
+  const effectifByClass = new Map(effectifs.map(e => [e.id_classe, e._count._all]));
+
+  const rows = [...keys].flatMap(k => {
+    const [idCours, idSeq] = k.split('|');
+    const a = courseById.get(idCours);
+    const s = seqById.get(idSeq);
+    if (!a || !s) return [];
+    const lock = lockMap.get(k);
+    const verrouille = Boolean(lock);
+    return [{
+      id_affectation_cours: a.id_affectation_cours,
+      id_sequence: s.id_sequence,
+      classe: a.classe.nom_classe,
+      matiere: a.matiere.libelle_matiere,
+      enseignant: a.enseignant.nom_complet,
+      coefficient: num(a.coefficient),
+      trimestre: s.trimestre.numero_trimestre,
+      sequence: s.numero_sequence,
+      effectif: effectifByClass.get(a.id_classe) ?? 0,
+      notes_saisies: counts.get(k) ?? 0,
+      statut: verrouille ? 'verrouille' as const : 'brouillon' as const,
+      date_verrouillage: lock?.date_verrouillage ?? null,
+      nom_fichier: buildFileName({
+        annee: year.libelle_annee,
+        classe: a.classe.nom_classe,
+        matiere: a.matiere.libelle_matiere,
+        trimestre: s.trimestre.numero_trimestre,
+        sequence: s.numero_sequence,
+        verrouille
+      })
+    }];
+  });
+
+  rows.sort((x, y) =>
+    x.classe.localeCompare(y.classe, 'fr') ||
+    x.matiere.localeCompare(y.matiere, 'fr') ||
+    x.trimestre - y.trimestre ||
+    x.sequence - y.sequence
+  );
+
+  return c.json({ annee: year.libelle_annee, rows });
+});
+
+// ---------------------------------------------------------------------------
+// Export Excel d'un fichier de notes (un cours + une séquence)
+// ---------------------------------------------------------------------------
+app.get('/dashboard/export', async c => {
+  const q = adminTargetSchema.safeParse(c.req.query());
+  if (!q.success) return error(c, 'Paramètres invalides');
+  const year = await activeYear();
+  if (!year) return error(c, 'Aucune année active');
+
+  const [a, s] = await Promise.all([
+    prisma.affectationCours.findFirst({
+      where: { id_affectation_cours: q.data.id_affectation_cours, id_annee: year.id_annee },
+      include: { classe: true, matiere: true, enseignant: { select: { nom_complet: true } } }
+    }),
+    getSequence(q.data.id_sequence, year.id_annee)
+  ]);
+  if (!a || !s) return error(c, 'Cours ou séquence introuvable', 404);
+
+  const [students, grades, lock] = await Promise.all([
+    prisma.affectationEleve.findMany({
+      where: { id_classe: a.id_classe, id_annee: year.id_annee },
+      include: { eleve: true },
+      orderBy: { eleve: { nom_complet: 'asc' } }
+    }),
+    prisma.note.findMany({ where: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } }),
+    prisma.verrouillageNote.findUnique({
+      where: { id_affectation_cours_id_sequence: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } }
+    })
+  ]);
+
+  const verrouille = lock?.est_verrouille ?? false;
+  const byId = new Map(grades.map(n => [n.id_eleve, n]));
+  const coefficient = num(a.coefficient);
+
+  const NAVY = 'FF0B1F4B';
+  const GOLD = 'FFC9A227';
+  const thin = { style: 'thin' as const, color: { argb: 'FFB8C2D6' } };
+  const border = { top: thin, left: thin, bottom: thin, right: thin };
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Collège Catholique Saint Charles Borromée';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('Notes');
+  ws.columns = [{ width: 8 }, { width: 46 }, { width: 14 }, { width: 20 }];
+  ws.pageSetup = { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
+
+  ws.mergeCells('A1:D1');
+  ws.getCell('A1').value = 'COLLÈGE CATHOLIQUE SAINT CHARLES BORROMÉE';
+  ws.getCell('A1').font = { bold: true, size: 14, color: { argb: NAVY } };
+  ws.getCell('A1').alignment = { horizontal: 'center' };
+
+  ws.mergeCells('A2:D2');
+  ws.getCell('A2').value = `Relevé de notes, trimestre ${s.trimestre.numero_trimestre}, séquence ${s.numero_sequence}`;
+  ws.getCell('A2').font = { bold: true, size: 11, color: { argb: GOLD } };
+  ws.getCell('A2').alignment = { horizontal: 'center' };
+
+  const dateVerrou = lock?.date_verrouillage ? lock.date_verrouillage.toLocaleDateString('fr-FR') : null;
+  const info: [string, string][] = [
+    ['Année scolaire', year.libelle_annee],
+    ['Classe', a.classe.nom_classe],
+    ['Matière', a.matiere.libelle_matiere],
+    ['Enseignant', a.enseignant.nom_complet],
+    ['Coefficient', String(coefficient)],
+    ['Statut', verrouille ? `Validé et verrouillé${dateVerrou ? ` le ${dateVerrou}` : ''}` : 'Brouillon (non validé)']
+  ];
+  info.forEach(([label, value], i) => {
+    const r = 4 + i;
+    ws.mergeCells(`A${r}:D${r}`);
+    ws.getCell(`A${r}`).value = { richText: [{ text: `${label} : `, font: { bold: true } }, { text: value }] };
+  });
+
+  const HEADER_ROW = 11;
+  const header = ws.getRow(HEADER_ROW);
+  header.values = ['N°', 'Nom et prénom(s) de l’élève', 'Note / 20', 'NxC (note × coefficient)'];
+  header.height = 22;
+  header.eachCell(cell => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
+    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    cell.border = border;
+  });
+  ws.views = [{ state: 'frozen', ySplit: HEADER_ROW }];
+
+  let sum = 0;
+  let count = 0;
+  students.forEach(({ eleve }, i) => {
+    const n = byId.get(eleve.id_eleve);
+    const note = n ? num(n.valeur_note) : null;
+    const nxc = n ? num(n.note_x_coefficient) : null;
+    if (note !== null) { sum += note; count += 1; }
+    const row = ws.addRow([i + 1, eleve.nom_complet, note, nxc]);
+    row.getCell(1).alignment = { horizontal: 'center' };
+    row.getCell(3).alignment = { horizontal: 'center' };
+    row.getCell(4).alignment = { horizontal: 'center' };
+    row.getCell(3).numFmt = '0.00';
+    row.getCell(4).numFmt = '0.00';
+    row.eachCell({ includeEmpty: true }, cell => { cell.border = border; });
+  });
+
+  ws.addRow([]);
+  [
+    `Effectif : ${students.length}`,
+    `Notes saisies : ${count} / ${students.length}`,
+    `Moyenne de la classe : ${count ? (sum / count).toFixed(2) : '—'} / 20`,
+    `Exporté le ${new Date().toLocaleString('fr-FR')}`
+  ].forEach(text => {
+    const r = ws.addRow([text]);
+    ws.mergeCells(`A${r.number}:D${r.number}`);
+    r.font = { bold: true };
+  });
+
+  const fileName = buildFileName({
+    annee: year.libelle_annee,
+    classe: a.classe.nom_classe,
+    matiere: a.matiere.libelle_matiere,
+    trimestre: s.trimestre.numero_trimestre,
+    sequence: s.numero_sequence,
+    verrouille
+  });
+
+  const buffer = await wb.xlsx.writeBuffer();
+  return c.body(new Uint8Array(buffer as ArrayBuffer), 200, {
+    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'Content-Disposition': `attachment; filename="${fileName}"`
+  });
+});
+
 
 export default app;

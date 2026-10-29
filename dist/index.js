@@ -6,13 +6,12 @@ import { serve } from '@hono/node-server';
 import { cors } from 'hono/cors';
 import notesApp from './routes/notes.js';
 const app = new Hono();
-// CORS : avec credentials=true, autoriser explicitement les origines du frontend.
-// Exemple FRONTEND_ORIGINS=http://localhost:5173,https://mon-frontend.example
-const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? 'http://localhost:5173,http://localhost:3000')
+// CORS : avec credentials=true, autoriser explicitement les origines du frontend (incluant Netlify et le développement local).
+const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? 'http://localhost:5173,http://localhost:3000,https://gesnotes.netlify.app')
     .split(',').map(value => value.trim()).filter(Boolean);
 app.use('/api/*', cors({
     origin: origin => allowedOrigins.includes(origin) ? origin : '',
-    allowMethods: ['GET', 'POST', 'OPTIONS'],
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
 }));
@@ -41,7 +40,7 @@ app.get('/doc', c => c.json({
     },
     servers: [
         { url: 'http://localhost:3000', description: 'Développement local' },
-        { url: 'https://note-o1lo.onrender.com', description: 'Production (si ce déploiement est toujours utilisé)' },
+        { url: 'https://note-o1lo.onrender.com', description: 'Production (Render)' },
     ],
     components: {
         securitySchemes: { BearerAuth: { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' } },
