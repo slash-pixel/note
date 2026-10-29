@@ -19,10 +19,16 @@ const uuid = z.string().uuid();
 const authSchema = z.object({ id_enseignant: uuid.optional(), id_admin: uuid.optional(), mot_de_passe: z.string().min(1) });
 const targetSchema = z.object({ id_classe: uuid, id_matiere: uuid, id_sequence: uuid });
 const notesSchema = targetSchema.extend({
-  notes: z.array(z.object({ id_eleve: uuid, valeur_note: z.number().finite().min(0).max(20) })).min(1)
+  coefficient: z.number().finite().min(0.01).max(99.99),
+  notes: z.array(z.object({
+    id_eleve: uuid,
+    valeur_note: z.number().finite().min(0).max(20)
+  })).min(1)
 }).superRefine((v, ctx) => {
   const ids = v.notes.map(n => n.id_eleve);
-  if (new Set(ids).size !== ids.length) ctx.addIssue({ code: 'custom', path: ['notes'], message: 'Élève présent plusieurs fois' });
+  if (new Set(ids).size !== ids.length) {
+    ctx.addIssue({ code: 'custom', path: ['notes'], message: 'Élève présent plusieurs fois' });
+  }
 });
 const adminTargetSchema = z.object({ id_affectation_cours: uuid, id_sequence: uuid });
 const decimal = (v: number | Prisma.Decimal) => new Prisma.Decimal(v.toString());
@@ -161,34 +167,164 @@ app.get('/notes/consultation', grid);
 
 app.post('/notes/sauvegarder', async c => {
   const parsed = notesSchema.safeParse(await c.req.json().catch(() => null));
-  if (!parsed.success) return c.json({ error: 'Données invalides', details: parsed.error.flatten() }, 400);
+  if (!parsed.success) {
+    return c.json({ error: 'Données invalides', details: parsed.error.flatten() }, 400);
+  }
+
   const target = await resolveTarget(c, parsed.data);
   if ('failure' in target) return target.failure;
+
   const { a, s, year } = target;
   const ids = parsed.data.notes.map(n => n.id_eleve);
+  const nouveauCoefficient = decimal(parsed.data.coefficient).toDecimalPlaces(2);
+
   try {
     await prisma.$transaction(async tx => {
-      // A transaction-level advisory lock serializes saves/finalization for the same course and sequence.
-await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), hashtext(${s.id_sequence}))`;
-      const lock = await tx.verrouillageNote.findUnique({ where: { id_affectation_cours_id_sequence: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } } });
+      // Verrou commun au cours entier : empêche une modification du coefficient
+      // en parallèle d'une sauvegarde ou d'une validation.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), 0)`;
+
+      const lock = await tx.verrouillageNote.findUnique({
+        where: {
+          id_affectation_cours_id_sequence: {
+            id_affectation_cours: a.id_affectation_cours,
+            id_sequence: s.id_sequence
+          }
+        }
+      });
       if (lock?.est_verrouille) throw new Error('LOCKED');
-      const enrolled = await tx.affectationEleve.findMany({ where: { id_classe: a.id_classe, id_annee: year.id_annee, id_eleve: { in: ids } }, select: { id_eleve: true } });
+
+      const enrolled = await tx.affectationEleve.findMany({
+        where: {
+          id_classe: a.id_classe,
+          id_annee: year.id_annee,
+          id_eleve: { in: ids }
+        },
+        select: { id_eleve: true }
+      });
       if (enrolled.length !== ids.length) throw new Error('INVALID_STUDENTS');
+
+      const cours = await tx.affectationCours.findUniqueOrThrow({
+        where: { id_affectation_cours: a.id_affectation_cours },
+        select: { coefficient: true }
+      });
+      const coefficientChange = cours.coefficient.toString() !== nouveauCoefficient.toString();
+
+      if (coefficientChange) {
+        // Le coefficient étant commun à toutes les séquences de ce cours,
+        // on refuse de le changer si au moins une séquence est verrouillée.
+        const verrouExistant = await tx.verrouillageNote.findFirst({
+          where: {
+            id_affectation_cours: a.id_affectation_cours,
+            est_verrouille: true
+          },
+          select: { id_sequence: true }
+        });
+        if (verrouExistant) throw new Error('COEFFICIENT_LOCKED');
+
+        await tx.affectationCours.update({
+          where: { id_affectation_cours: a.id_affectation_cours },
+          data: { coefficient: nouveauCoefficient }
+        });
+
+        // Recalculer le NxC de toutes les notes existantes de ce cours.
+        const anciennesNotes = await tx.note.findMany({
+          where: { id_affectation_cours: a.id_affectation_cours },
+          select: { id_eleve: true, id_sequence: true, valeur_note: true }
+        });
+
+        for (const note of anciennesNotes) {
+          await tx.note.update({
+            where: {
+              id_eleve_id_affectation_cours_id_sequence: {
+                id_eleve: note.id_eleve,
+                id_affectation_cours: a.id_affectation_cours,
+                id_sequence: note.id_sequence
+              }
+            },
+            data: {
+              note_x_coefficient: note.valeur_note.mul(nouveauCoefficient).toDecimalPlaces(2)
+            }
+          });
+        }
+      }
+
+      // Sauvegarder les notes reçues avec le coefficient choisi.
       for (const n of parsed.data.notes) {
         const valeur_note = decimal(n.valeur_note).toDecimalPlaces(2);
-        const note_x_coefficient = valeur_note.mul(a.coefficient).toDecimalPlaces(2);
+        const note_x_coefficient = valeur_note.mul(nouveauCoefficient).toDecimalPlaces(2);
+
         await tx.note.upsert({
-          where: { id_eleve_id_affectation_cours_id_sequence: { id_eleve: n.id_eleve, id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } },
+          where: {
+            id_eleve_id_affectation_cours_id_sequence: {
+              id_eleve: n.id_eleve,
+              id_affectation_cours: a.id_affectation_cours,
+              id_sequence: s.id_sequence
+            }
+          },
           update: { valeur_note, note_x_coefficient },
-          create: { id_eleve: n.id_eleve, id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence, valeur_note, note_x_coefficient }
+          create: {
+            id_eleve: n.id_eleve,
+            id_affectation_cours: a.id_affectation_cours,
+            id_sequence: s.id_sequence,
+            valeur_note,
+            note_x_coefficient
+          }
         });
-        await refreshQuarter(tx, n.id_eleve, a.id_affectation_cours, s, a.coefficient);
+      }
+
+      // Recalculer les résultats trimestriels de tous les élèves ayant des notes
+      // dans ce cours, car le coefficient peut avoir changé pour les anciennes séquences.
+      const notesDuCours = await tx.note.findMany({
+        where: { id_affectation_cours: a.id_affectation_cours },
+        select: { id_eleve: true, id_sequence: true }
+      });
+      const sequenceIds = [...new Set(notesDuCours.map(n => n.id_sequence))];
+      const sequences = await tx.sequence.findMany({
+        where: { id_sequence: { in: sequenceIds } },
+        include: {
+          trimestre: {
+            include: {
+              sequences: { orderBy: { numero_sequence: 'asc' } }
+            }
+          }
+        }
+      });
+      const sequenceById = new Map(sequences.map(sequence => [sequence.id_sequence, sequence]));
+      const dejaActualises = new Set<string>();
+
+      for (const note of notesDuCours) {
+        const sequence = sequenceById.get(note.id_sequence);
+        if (!sequence) continue;
+        const key = `${note.id_eleve}:${sequence.id_trimestre}`;
+        if (dejaActualises.has(key)) continue;
+        dejaActualises.add(key);
+        await refreshQuarter(
+          tx,
+          note.id_eleve,
+          a.id_affectation_cours,
+          sequence,
+          nouveauCoefficient
+        );
       }
     }, { timeout: 20000 });
-    return c.json({ success: true, message: 'Brouillon enregistré', est_verrouille: false });
+
+    return c.json({
+      success: true,
+      message: 'Notes et coefficient enregistrés',
+      coefficient: Number(nouveauCoefficient),
+      est_verrouille: false
+    });
   } catch (e) {
-    if (e instanceof Error && e.message === 'LOCKED') return error(c, 'Notes validées : modification interdite. Demandez une réouverture à l’administration.', 409);
-    if (e instanceof Error && e.message === 'INVALID_STUDENTS') return error(c, 'Un ou plusieurs élèves ne sont pas inscrits dans cette classe');
+    if (e instanceof Error && e.message === 'LOCKED') {
+      return error(c, 'Notes validées : modification interdite. Demandez une réouverture à l’administration.', 409);
+    }
+    if (e instanceof Error && e.message === 'COEFFICIENT_LOCKED') {
+      return error(c, 'Impossible de modifier le coefficient : une séquence de ce cours est déjà verrouillée.', 409);
+    }
+    if (e instanceof Error && e.message === 'INVALID_STUDENTS') {
+      return error(c, 'Un ou plusieurs élèves ne sont pas inscrits dans cette classe');
+    }
     console.error('Sauvegarde des notes', e);
     return error(c, 'Échec de la sauvegarde', 400);
   }
@@ -202,7 +338,7 @@ app.post('/notes/valider', async c => {
   const { a, s, year } = target;
   try {
     const result = await prisma.$transaction(async tx => {
-await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), hashtext(${s.id_sequence}))`;
+await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), 0)`;
       const enrolled = await tx.affectationEleve.findMany({ where: { id_classe: a.id_classe, id_annee: year.id_annee }, select: { id_eleve: true } });
       if (!enrolled.length) throw new Error('EMPTY_CLASS');
       const grades = await tx.note.findMany({ where: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence, id_eleve: { in: enrolled.map(e => e.id_eleve) } }, select: { id_eleve: true } });
@@ -239,7 +375,7 @@ app.post('/notes/admin/deverrouiller', async c => {
   ]);
   if (!a || !s) return error(c, 'Cours ou séquence introuvable', 404);
   const lock = await prisma.$transaction(async tx => {
-await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${id_affectation_cours}), hashtext(${id_sequence}))`;
+await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${id_affectation_cours}), 0)`;
     return tx.verrouillageNote.upsert({
       where: { id_affectation_cours_id_sequence: { id_affectation_cours, id_sequence } },
       update: { est_verrouille: false, date_verrouillage: null, id_admin: c.get('actor').id },
