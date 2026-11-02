@@ -1,14 +1,10 @@
 import { Hono } from 'hono';
 import { Prisma, PrismaClient } from '@prisma/client';
-   import ExcelJS from 'exceljs';
-   import { createHash, timingSafeEqual } from 'node:crypto';
+import ExcelJS from 'exceljs';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { sign, verify } from 'hono/jwt';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
-
-
-
-
 
 
 const prisma = new PrismaClient();
@@ -68,7 +64,18 @@ app.get('/sequences', async c => {
   const year = await activeYear();
   if (!year) return error(c, 'Aucune année active');
   const trimestres = await prisma.trimestre.findMany({ where: { id_annee: year.id_annee }, orderBy: { numero_trimestre: 'asc' }, include: { sequences: { orderBy: { numero_sequence: 'asc' } } } });
-  return c.json(trimestres.map(t => ({ id_trimestre: t.id_trimestre, numero_trimestre: t.numero_trimestre, libelle_trimestre: `Trimestre ${t.numero_trimestre}`, sequences: t.sequences.map(s => ({ id_sequence: s.id_sequence, numero_sequence: s.numero_sequence, libelle_sequence: `Séquence ${s.numero_sequence}` })) })));
+  return c.json(trimestres.map(t => ({
+    id_trimestre: t.id_trimestre,
+    numero_trimestre: t.numero_trimestre,
+    libelle_trimestre: `Trimestre ${t.numero_trimestre}`,
+    sequences: t.sequences.map((s, index) => ({
+      id_sequence: s.id_sequence,
+      numero_sequence: s.numero_sequence,
+      type_sequence: index === 0 ? 'cc' : 'eva',
+      poids: index === 0 ? 30 : 70,
+      libelle_sequence: index === 0 ? `CC${t.numero_trimestre}` : `Éva de niveau ${t.numero_trimestre}`
+    }))
+  })));
 });
 app.get('/classes', async c => {
   const year = await activeYear();
@@ -119,25 +126,65 @@ async function resolveTarget(c: any, input: z.infer<typeof targetSchema>) {
   if (!s) return { failure: error(c, 'Séquence introuvable', 404) };
   return { a, s, year };
 }
-async function refreshQuarter(tx: Prisma.TransactionClient, id_eleve: string, id_affectation_cours: string, sequence: NonNullable<Awaited<ReturnType<typeof getSequence>>>, coefficient: Prisma.Decimal) {
-  const sequenceIds = sequence.trimestre.sequences.map(s => s.id_sequence);
-  if (sequenceIds.length !== 2) {
-    await tx.resultatTrimestriel.deleteMany({ where: { id_eleve, id_affectation_cours, id_trimestre: sequence.id_trimestre } });
-    return;
-  }
-  const notes = await tx.note.findMany({ where: { id_eleve, id_affectation_cours, id_sequence: { in: sequenceIds } } });
-  if (notes.length !== 2) {
-    await tx.resultatTrimestriel.deleteMany({ where: { id_eleve, id_affectation_cours, id_trimestre: sequence.id_trimestre } });
-    return;
-  }
-  const somme_notes = notes.reduce((sum, n) => sum.plus(n.valeur_note), decimal(0));
-  const moyenne_trimestrielle = somme_notes.div(2).toDecimalPlaces(2);
-  const moyenne_x_coefficient = moyenne_trimestrielle.mul(coefficient).toDecimalPlaces(2);
-  await tx.resultatTrimestriel.upsert({
-    where: { id_eleve_id_affectation_cours_id_trimestre: { id_eleve, id_affectation_cours, id_trimestre: sequence.id_trimestre } },
-    update: { somme_notes, moyenne_trimestrielle, moyenne_x_coefficient },
-    create: { id_eleve, id_affectation_cours, id_trimestre: sequence.id_trimestre, somme_notes, moyenne_trimestrielle, moyenne_x_coefficient }
+const POIDS_CC = new Prisma.Decimal('0.3');
+const POIDS_EVA = new Prisma.Decimal('0.7');
+type TrimestreAvecSequences = NonNullable<Awaited<ReturnType<typeof getSequence>>>['trimestre'];
+
+// 1re séquence du trimestre = CC, 2e = Éva de niveau
+const rolesTrimestre = (t: TrimestreAvecSequences) => ({ cc: t.sequences[0] ?? null, eva: t.sequences[1] ?? null });
+const libelleCC = (numeroTrimestre: number) => `CC${numeroTrimestre}`;
+const libelleEva = (numeroTrimestre: number) => `Éva de niveau ${numeroTrimestre}`;
+
+function calculerTrimestre(
+  cc: Prisma.Decimal | null | undefined,
+  eva: Prisma.Decimal | null | undefined,
+  coefficient: Prisma.Decimal
+) {
+  if (cc == null || eva == null) return null;
+  const moyenne = cc.mul(POIDS_CC).plus(eva.mul(POIDS_EVA)).toDecimalPlaces(2); // 30 % CC + 70 % Éva
+  return {
+    somme: cc.plus(eva),
+    moyenne,
+    moyenneXCoef: moyenne.mul(coefficient).toDecimalPlaces(2) // NxC du trimestre
+  };
+}
+
+// Recalcule le résultat d'un élève pour un trimestre. Ne supprime JAMAIS rien :
+// tant que CC et Éva ne sont pas tous les deux saisis, il n'y a simplement pas de résultat.
+async function refreshTrimestre(
+  tx: Prisma.TransactionClient,
+  id_eleve: string,
+  id_affectation_cours: string,
+  trimestre: TrimestreAvecSequences,
+  coefficient: Prisma.Decimal
+) {
+  const { cc, eva } = rolesTrimestre(trimestre);
+  if (!cc || !eva) return;
+  const notes = await tx.note.findMany({
+    where: { id_eleve, id_affectation_cours, id_sequence: { in: [cc.id_sequence, eva.id_sequence] } }
   });
+  const r = calculerTrimestre(
+    notes.find(n => n.id_sequence === cc.id_sequence)?.valeur_note,
+    notes.find(n => n.id_sequence === eva.id_sequence)?.valeur_note,
+    coefficient
+  );
+  if (!r) return;
+  await tx.resultatTrimestriel.upsert({
+    where: { id_eleve_id_affectation_cours_id_trimestre: { id_eleve, id_affectation_cours, id_trimestre: trimestre.id_trimestre } },
+    update: { somme_notes: r.somme, moyenne_trimestrielle: r.moyenne, moyenne_x_coefficient: r.moyenneXCoef },
+    create: { id_eleve, id_affectation_cours, id_trimestre: trimestre.id_trimestre, somme_notes: r.somme, moyenne_trimestrielle: r.moyenne, moyenne_x_coefficient: r.moyenneXCoef }
+  });
+}
+
+// Wrapper : garde la compatibilité avec les anciennes routes
+async function refreshQuarter(
+  tx: Prisma.TransactionClient,
+  id_eleve: string,
+  id_affectation_cours: string,
+  sequence: NonNullable<Awaited<ReturnType<typeof getSequence>>>,
+  coefficient: Prisma.Decimal
+) {
+  await refreshTrimestre(tx, id_eleve, id_affectation_cours, sequence.trimestre, coefficient);
 }
 async function grid(c: any) {
   const q = targetSchema.safeParse(c.req.query());
@@ -405,30 +452,331 @@ app.get('/notes/resultats-trimestriels', async c => {
   const a = await getAssignment(q.data.id_matiere, q.data.id_classe, year.id_annee);
   if (!a) return error(c, 'Cours introuvable', 404);
   if (!isOwner(c.get('actor'), a)) return error(c, 'Accès refusé', 403);
-  const t = await prisma.trimestre.findFirst({ where: { id_trimestre: q.data.id_trimestre, id_annee: year.id_annee } });
+  const t = await prisma.trimestre.findFirst({
+    where: { id_trimestre: q.data.id_trimestre, id_annee: year.id_annee },
+    include: { sequences: { orderBy: { numero_sequence: 'asc' } } }
+  });
   if (!t) return error(c, 'Trimestre introuvable', 404);
-  const students = await prisma.affectationEleve.findMany({ where: { id_classe: a.id_classe, id_annee: year.id_annee }, include: { eleve: true }, orderBy: { eleve: { nom_complet: 'asc' } } });
-  const results = await prisma.resultatTrimestriel.findMany({ where: { id_affectation_cours: a.id_affectation_cours, id_trimestre: t.id_trimestre } });
-  const map = new Map(results.map(r => [r.id_eleve, r]));
-  return c.json({ coefficient: num(a.coefficient), resultats: students.map(({ eleve }) => {
-    const r = map.get(eleve.id_eleve);
-    return { id_eleve: eleve.id_eleve, nom_complet: eleve.nom_complet, somme_notes: r ? num(r.somme_notes) : null, moyenne_trimestrielle: r ? num(r.moyenne_trimestrielle) : null, moyenne_x_coefficient: r ? num(r.moyenne_x_coefficient) : null };
-  }) });
+  const { cc, eva } = rolesTrimestre(t);
+  if (!cc || !eva || t.sequences.length !== 2) {
+    return error(c, 'Ce trimestre doit contenir exactement deux séquences (CC puis Éva de niveau)', 409);
+  }
+  const [students, grades] = await Promise.all([
+    prisma.affectationEleve.findMany({
+      where: { id_classe: a.id_classe, id_annee: year.id_annee },
+      include: { eleve: true },
+      orderBy: { eleve: { nom_complet: 'asc' } }
+    }),
+    prisma.note.findMany({
+      where: { id_affectation_cours: a.id_affectation_cours, id_sequence: { in: [cc.id_sequence, eva.id_sequence] } }
+    })
+  ]);
+  const notesParEleve = new Map<string, { cc?: Prisma.Decimal; eva?: Prisma.Decimal }>();
+  for (const note of grades) {
+    const entry = notesParEleve.get(note.id_eleve) ?? {};
+    if (note.id_sequence === cc.id_sequence) entry.cc = note.valeur_note;
+    if (note.id_sequence === eva.id_sequence) entry.eva = note.valeur_note;
+    notesParEleve.set(note.id_eleve, entry);
+  }
+  return c.json({
+    coefficient: num(a.coefficient),
+    resultats: students.map(({ eleve }) => {
+      const notes = notesParEleve.get(eleve.id_eleve);
+      const resultat = calculerTrimestre(notes?.cc, notes?.eva, a.coefficient);
+      return {
+        id_eleve: eleve.id_eleve,
+        nom_complet: eleve.nom_complet,
+        note_cc: notes?.cc == null ? null : num(notes.cc),
+        note_eva: notes?.eva == null ? null : num(notes.eva),
+        somme_notes: resultat ? num(resultat.somme) : null,
+        moyenne_trimestrielle: resultat ? num(resultat.moyenne) : null,
+        moyenne_x_coefficient: resultat ? num(resultat.moyenneXCoef) : null
+      };
+    })
+  });
 });
 
+const trimestreTargetSchema = z.object({ id_classe: uuid, id_matiere: uuid, id_trimestre: uuid });
 
-// ============================================================================
-// À COLLER dans src/routes/notes.ts, juste AVANT la ligne « export default app; »
-//
-// 1) En haut de notes.ts, ajouter les imports :
-//      import ExcelJS from 'exceljs';
-//      import { createHash, timingSafeEqual } from 'node:crypto';
-// 2) Installer la dépendance :
-//      npm install exceljs
-// 3) Sur Render (Environment), créer la variable :
-//      DASHBOARD_PASSWORD = le mot de passe de votre choix (8 caractères minimum)
-// ============================================================================
+async function resolveTrimestre(c: any, input: z.infer<typeof trimestreTargetSchema>) {
+  const year = await activeYear();
+  if (!year) return { failure: error(c, 'Aucune année active') };
+  const a = await getAssignment(input.id_matiere, input.id_classe, year.id_annee);
+  if (!a) return { failure: error(c, 'Cours introuvable', 404) };
+  if (!isOwner(c.get('actor'), a)) return { failure: error(c, 'Accès refusé', 403) };
+  const t = await prisma.trimestre.findFirst({
+    where: { id_trimestre: input.id_trimestre, id_annee: year.id_annee },
+    include: { sequences: { orderBy: { numero_sequence: 'asc' } } }
+  });
+  if (!t) return { failure: error(c, 'Trimestre introuvable', 404) };
+  const { cc, eva } = rolesTrimestre(t);
+  if (!cc || !eva || t.sequences.length !== 2) {
+    return { failure: error(c, 'Ce trimestre doit contenir exactement deux séquences (CC puis Éva de niveau)', 409) };
+  }
+  return { a, t, year, cc, eva };
+}
 
+app.get('/notes/grille-trimestre', async c => {
+  const q = trimestreTargetSchema.safeParse(c.req.query());
+  if (!q.success) return error(c, 'Paramètres invalides');
+  const target = await resolveTrimestre(c, q.data);
+  if ('failure' in target) return target.failure;
+  const { a, t, year, cc, eva } = target;
+
+  const [students, grades, locks] = await Promise.all([
+    prisma.affectationEleve.findMany({
+      where: { id_classe: a.id_classe, id_annee: year.id_annee },
+      include: { eleve: true },
+      orderBy: { eleve: { nom_complet: 'asc' } }
+    }),
+    prisma.note.findMany({
+      where: { id_affectation_cours: a.id_affectation_cours, id_sequence: { in: [cc.id_sequence, eva.id_sequence] } }
+    }),
+    // tous les verrous du cours (toutes séquences) : le coefficient est commun au cours entier
+    prisma.verrouillageNote.findMany({ where: { id_affectation_cours: a.id_affectation_cours, est_verrouille: true } })
+  ]);
+
+  const lockOf = (id_sequence: string) => locks.find(l => l.id_sequence === id_sequence);
+  const notesDe = (id_sequence: string) =>
+    new Map(grades.filter(n => n.id_sequence === id_sequence).map(n => [n.id_eleve, n.valeur_note]));
+  const ccNotes = notesDe(cc.id_sequence);
+  const evaNotes = notesDe(eva.id_sequence);
+  const colonne = (s: typeof cc, type: 'cc' | 'eva', libelle: string, poids: number) => ({
+    id_sequence: s.id_sequence,
+    type,
+    libelle,
+    poids,
+    est_verrouille: Boolean(lockOf(s.id_sequence)),
+    date_verrouillage: lockOf(s.id_sequence)?.date_verrouillage ?? null
+  });
+
+  return c.json({
+    id_affectation_cours: a.id_affectation_cours,
+    id_trimestre: t.id_trimestre,
+    numero_trimestre: t.numero_trimestre,
+    coefficient: num(a.coefficient),
+    coefficient_modifiable: locks.length === 0,
+    colonnes: {
+      cc: colonne(cc, 'cc', libelleCC(t.numero_trimestre), 30),
+      eva: colonne(eva, 'eva', libelleEva(t.numero_trimestre), 70)
+    },
+    grille: students.map(({ eleve }) => {
+      const noteCC = ccNotes.get(eleve.id_eleve);
+      const noteEva = evaNotes.get(eleve.id_eleve);
+      const r = calculerTrimestre(noteCC, noteEva, a.coefficient);
+      return {
+        id_eleve: eleve.id_eleve,
+        nom_complet: eleve.nom_complet,
+        note_cc: noteCC == null ? null : num(noteCC),
+        note_eva: noteEva == null ? null : num(noteEva),
+        moyenne_trimestrielle: r ? num(r.moyenne) : null,
+        note_x_coefficient: r ? num(r.moyenneXCoef) : null
+      };
+    })
+  });
+});
+
+// Enregistrer le brouillon. Règles :
+//  - une valeur absente / null n'efface JAMAIS une note déjà enregistrée ;
+//  - une colonne verrouillée est ignorée (ses notes ne sont pas touchées).
+const sauvegardeTrimestreSchema = trimestreTargetSchema.extend({
+  coefficient: z.number().finite().min(0.01).max(99.99),
+  notes: z.array(z.object({
+    id_eleve: uuid,
+    note_cc: z.number().finite().min(0).max(20).nullable().optional(),
+    note_eva: z.number().finite().min(0).max(20).nullable().optional()
+  })).min(1)
+}).superRefine((v, ctx) => {
+  const ids = v.notes.map(n => n.id_eleve);
+  if (new Set(ids).size !== ids.length) {
+    ctx.addIssue({ code: 'custom', path: ['notes'], message: 'Élève présent plusieurs fois' });
+  }
+});
+
+app.post('/notes/sauvegarder-trimestre', async c => {
+  const parsed = sauvegardeTrimestreSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: 'Données invalides', details: parsed.error.flatten() }, 400);
+  const target = await resolveTrimestre(c, parsed.data);
+  if ('failure' in target) return target.failure;
+  const { a, t, year, cc, eva } = target;
+  const ids = parsed.data.notes.map(n => n.id_eleve);
+  const nouveauCoefficient = decimal(parsed.data.coefficient).toDecimalPlaces(2);
+
+  try {
+    const enregistrees = await prisma.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), 0)`;
+
+      const verrous = await tx.verrouillageNote.findMany({
+        where: { id_affectation_cours: a.id_affectation_cours, est_verrouille: true },
+        select: { id_sequence: true }
+      });
+      const ccVerrouille = verrous.some(v => v.id_sequence === cc.id_sequence);
+      const evaVerrouille = verrous.some(v => v.id_sequence === eva.id_sequence);
+      if (ccVerrouille && evaVerrouille) throw new Error('ALL_LOCKED');
+
+      const enrolled = await tx.affectationEleve.findMany({
+        where: { id_classe: a.id_classe, id_annee: year.id_annee, id_eleve: { in: ids } },
+        select: { id_eleve: true }
+      });
+      if (enrolled.length !== ids.length) throw new Error('INVALID_STUDENTS');
+
+      const cours = await tx.affectationCours.findUniqueOrThrow({
+        where: { id_affectation_cours: a.id_affectation_cours },
+        select: { coefficient: true }
+      });
+      const coefficientChange = !cours.coefficient.equals(nouveauCoefficient);
+
+      if (coefficientChange) {
+        // Coefficient commun à tout le cours : interdit dès qu'une séquence est verrouillée.
+        if (verrous.length > 0) throw new Error('COEFFICIENT_LOCKED');
+        await tx.affectationCours.update({
+          where: { id_affectation_cours: a.id_affectation_cours },
+          data: { coefficient: nouveauCoefficient }
+        });
+        const anciennes = await tx.note.findMany({
+          where: { id_affectation_cours: a.id_affectation_cours },
+          select: { id_eleve: true, id_sequence: true, valeur_note: true }
+        });
+        for (const note of anciennes) {
+          await tx.note.update({
+            where: {
+              id_eleve_id_affectation_cours_id_sequence: {
+                id_eleve: note.id_eleve,
+                id_affectation_cours: a.id_affectation_cours,
+                id_sequence: note.id_sequence
+              }
+            },
+            data: { note_x_coefficient: note.valeur_note.mul(nouveauCoefficient).toDecimalPlaces(2) }
+          });
+        }
+      }
+
+      let total = 0;
+      const enregistrer = async (id_eleve: string, id_sequence: string, valeur: number) => {
+        const valeur_note = decimal(valeur).toDecimalPlaces(2);
+        const note_x_coefficient = valeur_note.mul(nouveauCoefficient).toDecimalPlaces(2);
+        await tx.note.upsert({
+          where: { id_eleve_id_affectation_cours_id_sequence: { id_eleve, id_affectation_cours: a.id_affectation_cours, id_sequence } },
+          update: { valeur_note, note_x_coefficient },
+          create: { id_eleve, id_affectation_cours: a.id_affectation_cours, id_sequence, valeur_note, note_x_coefficient }
+        });
+        total += 1;
+      };
+      for (const n of parsed.data.notes) {
+        if (!ccVerrouille && n.note_cc != null) await enregistrer(n.id_eleve, cc.id_sequence, n.note_cc);
+        if (!evaVerrouille && n.note_eva != null) await enregistrer(n.id_eleve, eva.id_sequence, n.note_eva);
+      }
+
+      // Recalcul des moyennes de trimestre (30 % CC + 70 % Éva) puis × coefficient
+      if (coefficientChange) {
+        const trimestres = await tx.trimestre.findMany({
+          where: { id_annee: year.id_annee },
+          include: { sequences: { orderBy: { numero_sequence: 'asc' } } }
+        });
+        const eleves = await tx.note.findMany({
+          where: { id_affectation_cours: a.id_affectation_cours },
+          select: { id_eleve: true },
+          distinct: ['id_eleve']
+        });
+        for (const tr of trimestres) {
+          for (const e of eleves) await refreshTrimestre(tx, e.id_eleve, a.id_affectation_cours, tr, nouveauCoefficient);
+        }
+      } else {
+        for (const id_eleve of ids) await refreshTrimestre(tx, id_eleve, a.id_affectation_cours, t, nouveauCoefficient);
+      }
+      return total;
+    }, { timeout: 20000 });
+
+    return c.json({
+      success: true,
+      message: 'Notes et coefficient enregistrés',
+      coefficient: Number(nouveauCoefficient),
+      notes_enregistrees: enregistrees
+    });
+  } catch (e) {
+    if (e instanceof Error && e.message === 'ALL_LOCKED') return error(c, 'CC et Éva de niveau sont déjà verrouillés. Demandez une réouverture à l’administration.', 409);
+    if (e instanceof Error && e.message === 'COEFFICIENT_LOCKED') return error(c, 'Impossible de modifier le coefficient : une séquence de ce cours est déjà verrouillée.', 409);
+    if (e instanceof Error && e.message === 'INVALID_STUDENTS') return error(c, 'Un ou plusieurs élèves ne sont pas inscrits dans cette classe');
+    console.error('Sauvegarde trimestre', e);
+    return error(c, 'Échec de la sauvegarde', 400);
+  }
+});
+
+// Verrouiller : 'cc' seul, 'eva' seule, ou 'tout'.
+// Ce qui est DÉJÀ verrouillé n'est jamais retouché (date et administrateur conservés) :
+// « tout » verrouille simplement ce qui ne l'est pas encore.
+app.post('/notes/valider-trimestre', async c => {
+  const parsed = trimestreTargetSchema.extend({ parties: z.enum(['cc', 'eva', 'tout']) })
+    .safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return error(c, 'Données invalides');
+  const target = await resolveTrimestre(c, parsed.data);
+  if ('failure' in target) return target.failure;
+  const { a, t, year, cc, eva } = target;
+  const { parties } = parsed.data;
+
+  try {
+    const verrouilles = await prisma.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), 0)`;
+
+      const enrolled = await tx.affectationEleve.findMany({
+        where: { id_classe: a.id_classe, id_annee: year.id_annee },
+        select: { id_eleve: true }
+      });
+      if (!enrolled.length) throw new Error('EMPTY_CLASS');
+
+      const cibles = [
+        ...(parties !== 'eva' ? [{ seq: cc, label: libelleCC(t.numero_trimestre) }] : []),
+        ...(parties !== 'cc' ? [{ seq: eva, label: libelleEva(t.numero_trimestre) }] : [])
+      ];
+      const dejaVerrouilles = new Set(
+        (await tx.verrouillageNote.findMany({
+          where: { id_affectation_cours: a.id_affectation_cours, id_sequence: { in: cibles.map(x => x.seq.id_sequence) }, est_verrouille: true },
+          select: { id_sequence: true }
+        })).map(v => v.id_sequence)
+      );
+      const aVerrouiller = cibles.filter(x => !dejaVerrouilles.has(x.seq.id_sequence));
+      if (!aVerrouiller.length) throw new Error('ALREADY_LOCKED');
+
+      // Tout doit être complet avant de verrouiller quoi que ce soit (tout ou rien)
+      for (const cible of aVerrouiller) {
+        const nb = await tx.note.count({
+          where: {
+            id_affectation_cours: a.id_affectation_cours,
+            id_sequence: cible.seq.id_sequence,
+            id_eleve: { in: enrolled.map(e => e.id_eleve) }
+          }
+        });
+        if (nb !== enrolled.length) throw new Error(`INCOMPLETE:${cible.label}`);
+      }
+
+      const actor = c.get('actor');
+      const id_admin = actor.role === 'admin' ? actor.id : null;
+      const maintenant = new Date();
+      for (const cible of aVerrouiller) {
+        await tx.verrouillageNote.upsert({
+          where: { id_affectation_cours_id_sequence: { id_affectation_cours: a.id_affectation_cours, id_sequence: cible.seq.id_sequence } },
+          update: { est_verrouille: true, date_verrouillage: maintenant, id_admin },
+          create: { id_affectation_cours: a.id_affectation_cours, id_sequence: cible.seq.id_sequence, est_verrouille: true, date_verrouillage: maintenant, id_admin }
+        });
+      }
+      return aVerrouiller.map(x => x.label);
+    }, { timeout: 20000 });
+
+    return c.json({ success: true, message: `Verrouillé : ${verrouilles.join(' et ')}`, verrouilles });
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith('INCOMPLETE:')) {
+      return error(c, `${e.message.slice('INCOMPLETE:'.length)} : tous les élèves de la classe doivent avoir une note avant verrouillage`, 409);
+    }
+    if (e instanceof Error && e.message === 'EMPTY_CLASS') return error(c, 'Impossible de valider une classe vide', 409);
+    if (e instanceof Error && e.message === 'ALREADY_LOCKED') return error(c, 'Déjà verrouillé', 409);
+    console.error('Validation trimestre', e);
+    return error(c, 'Échec de validation');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Dashboard sécurisé par mot de passe
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // Accès au dashboard : un simple mot de passe partagé (DASHBOARD_PASSWORD)
 // ---------------------------------------------------------------------------
@@ -479,7 +827,7 @@ app.use('/dashboard/*', async (c, next) => {
 
 // ---------------------------------------------------------------------------
 // NOMENCLATURE DES FICHIERS (le seul endroit à modifier pour changer le nom)
-// Exemple : NOTES_2026-2027_6EME-M-1_MATHEMATIQUES_T1-S1_VALIDE.xlsx
+// Exemple : NOTES_2026-2027_6EME-M-1_MATHEMATIQUES_T1-CC_VALIDE.xlsx
 // ---------------------------------------------------------------------------
 const slug = (v: string) =>
   v
@@ -494,10 +842,10 @@ const buildFileName = (p: {
   classe: string;
   matiere: string;
   trimestre: number;
-  sequence: number;
+  partie: 'cc' | 'eva';
   verrouille: boolean;
 }) =>
-  `NOTES_${slug(p.annee)}_${slug(p.classe)}_${slug(p.matiere)}_T${p.trimestre}-S${p.sequence}_${p.verrouille ? 'VALIDE' : 'BROUILLON'}.xlsx`;
+  `NOTES_${slug(p.annee)}_${slug(p.classe)}_${slug(p.matiere)}_T${p.trimestre}-${p.partie === 'cc' ? 'CC' : 'EVA'}_${p.verrouille ? 'VALIDE' : 'BROUILLON'}.xlsx`;
 
 // ---------------------------------------------------------------------------
 // Dashboard : tous les fichiers de notes enregistrés (brouillon) ou verrouillés
@@ -511,6 +859,13 @@ app.get('/dashboard/liste', async c => {
     include: { trimestre: true }
   });
   const seqById = new Map(sequences.map(s => [s.id_sequence, s]));
+  const typeSeq = new Map<string, 'cc' | 'eva'>();
+  for (const idTrimestre of new Set(sequences.map(s => s.id_trimestre))) {
+    sequences
+      .filter(s => s.id_trimestre === idTrimestre)
+      .sort((x, y) => x.numero_sequence - y.numero_sequence)
+      .forEach((s, index) => typeSeq.set(s.id_sequence, index === 0 ? 'cc' : 'eva'));
+  }
   const seqIds = sequences.map(s => s.id_sequence);
 
   const [noteGroups, locks, effectifs] = await Promise.all([
@@ -556,6 +911,8 @@ app.get('/dashboard/liste', async c => {
       coefficient: num(a.coefficient),
       trimestre: s.trimestre.numero_trimestre,
       sequence: s.numero_sequence,
+      type: typeSeq.get(s.id_sequence) ?? 'cc',
+      libelle_partie: typeSeq.get(s.id_sequence) === 'eva' ? `Éva de niveau ${s.trimestre.numero_trimestre}` : `CC${s.trimestre.numero_trimestre}`,
       effectif: effectifByClass.get(a.id_classe) ?? 0,
       notes_saisies: counts.get(k) ?? 0,
       statut: verrouille ? 'verrouille' as const : 'brouillon' as const,
@@ -565,7 +922,7 @@ app.get('/dashboard/liste', async c => {
         classe: a.classe.nom_classe,
         matiere: a.matiere.libelle_matiere,
         trimestre: s.trimestre.numero_trimestre,
-        sequence: s.numero_sequence,
+        partie: typeSeq.get(s.id_sequence) ?? 'cc',
         verrouille
       })
     }];
@@ -633,7 +990,12 @@ app.get('/dashboard/export', async c => {
   ws.getCell('A1').alignment = { horizontal: 'center' };
 
   ws.mergeCells('A2:D2');
-  ws.getCell('A2').value = `Relevé de notes, trimestre ${s.trimestre.numero_trimestre}, séquence ${s.numero_sequence}`;
+  const partie: 'cc' | 'eva' = s.trimestre.sequences
+    .slice()
+    .sort((x, y) => x.numero_sequence - y.numero_sequence)
+    .findIndex(x => x.id_sequence === s.id_sequence) === 0 ? 'cc' : 'eva';
+  const libellePartie = partie === 'cc' ? `CC${s.trimestre.numero_trimestre} (30 %)` : `Éva de niveau ${s.trimestre.numero_trimestre} (70 %)`;
+  ws.getCell('A2').value = `Relevé de notes, ${libellePartie}`;
   ws.getCell('A2').font = { bold: true, size: 11, color: { argb: GOLD } };
   ws.getCell('A2').alignment = { horizontal: 'center' };
 
@@ -654,7 +1016,7 @@ app.get('/dashboard/export', async c => {
 
   const HEADER_ROW = 11;
   const header = ws.getRow(HEADER_ROW);
-  header.values = ['N°', 'Nom et prénom(s) de l’élève', 'Note / 20', 'NxC (note × coefficient)'];
+  header.values = ['N°', 'Nom et prénom(s) de l’élève', 'Note / 20', 'Contribution au trimestre'];
   header.height = 22;
   header.eachCell(cell => {
     cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
@@ -669,9 +1031,10 @@ app.get('/dashboard/export', async c => {
   students.forEach(({ eleve }, i) => {
     const n = byId.get(eleve.id_eleve);
     const note = n ? num(n.valeur_note) : null;
-    const nxc = n ? num(n.note_x_coefficient) : null;
-    if (note !== null) { sum += note; count += 1; }
-    const row = ws.addRow([i + 1, eleve.nom_complet, note, nxc]);
+    const poids = partie === 'cc' ? 0.30 : 0.70;
+    const contribution = note === null ? null : Number((note * poids).toFixed(2));
+    if (contribution !== null) { sum += contribution; count += 1; }
+    const row = ws.addRow([i + 1, eleve.nom_complet, note, contribution]);
     row.getCell(1).alignment = { horizontal: 'center' };
     row.getCell(3).alignment = { horizontal: 'center' };
     row.getCell(4).alignment = { horizontal: 'center' };
@@ -684,7 +1047,7 @@ app.get('/dashboard/export', async c => {
   [
     `Effectif : ${students.length}`,
     `Notes saisies : ${count} / ${students.length}`,
-    `Moyenne de la classe : ${count ? (sum / count).toFixed(2) : '—'} / 20`,
+    `Contribution moyenne de la classe : ${count ? (sum / count).toFixed(2) : '—'} / 20 (avant coefficient)`,
     `Exporté le ${new Date().toLocaleString('fr-FR')}`
   ].forEach(text => {
     const r = ws.addRow([text]);
@@ -697,7 +1060,7 @@ app.get('/dashboard/export', async c => {
     classe: a.classe.nom_classe,
     matiere: a.matiere.libelle_matiere,
     trimestre: s.trimestre.numero_trimestre,
-    sequence: s.numero_sequence,
+    partie,
     verrouille
   });
 
