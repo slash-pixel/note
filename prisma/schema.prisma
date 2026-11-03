@@ -57,6 +57,9 @@ model Classe {
   id_classe  String @id @default(uuid()) @db.Uuid
   nom_classe String @unique
 
+  id_niveau String? @db.Uuid
+
+  niveau       Niveau?              @relation(fields: [id_niveau], references: [id_niveau], onDelete: Restrict)
   eleves       AffectationEleve[]
   affectations AffectationCours[]
 }
@@ -74,6 +77,8 @@ model Eleve {
 model Matiere {
   id_matiere      String @id @default(uuid()) @db.Uuid
   libelle_matiere String @unique
+
+  niveaux ProgrammeNiveau[]
 
   affectations             AffectationCours[]
   autorisationsEnseignants AutorisationMatiere[]
@@ -266,5 +271,34 @@ model AutorisationMatiere {
   matiere    Matiere    @relation(fields: [id_matiere], references: [id_matiere], onDelete: Restrict)
 
   @@unique([id_enseignant, id_matiere])
+  @@index([id_matiere])
+}
+
+// --------------------------------------------------
+// NIVEAUX SCOLAIRES
+// --------------------------------------------------
+
+model Niveau {
+  id_niveau     String @id @default(uuid()) @db.Uuid
+  libelle_niveau String @unique
+
+  classes  Classe[]
+  matieres ProgrammeNiveau[]
+}
+
+// --------------------------------------------------
+// PROGRAMME DES MATIÈRES PAR NIVEAU
+// --------------------------------------------------
+model ProgrammeNiveau {
+  id_programme String @id @default(uuid()) @db.Uuid
+
+  id_niveau  String @db.Uuid
+  id_matiere String @db.Uuid
+
+  niveau Niveau @relation(fields: [id_niveau], references: [id_niveau], onDelete: Restrict)
+
+  matiere Matiere @relation(fields: [id_matiere], references: [id_matiere], onDelete: Restrict)
+
+  @@unique([id_niveau, id_matiere])
   @@index([id_matiere])
 }

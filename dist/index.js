@@ -1,5 +1,6 @@
 // src/index.ts — compatible avec src/routes/note.ts (ou notes.ts)
 import 'dotenv/config';
+import niveauxApp from './routes/niveaux.js';
 import { Hono } from 'hono';
 import { apiReference } from '@scalar/hono-api-reference';
 import { serve } from '@hono/node-server';
@@ -17,6 +18,7 @@ app.use('/api/*', cors({
 }));
 app.get('/', c => c.json({ success: true, message: 'API de gestion scolaire active' }));
 app.route('/api', notesApp);
+app.route('/api', niveauxApp);
 const uuid = { type: 'string', format: 'uuid' };
 const param = (name, where = 'query') => ({ name, in: where, required: true, schema: uuid });
 const jsonBody = (schema) => ({ required: true, content: { 'application/json': { schema } } });
