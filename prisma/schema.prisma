@@ -75,7 +75,8 @@ model Matiere {
   id_matiere      String @id @default(uuid()) @db.Uuid
   libelle_matiere String @unique
 
-  affectations AffectationCours[]
+  affectations             AffectationCours[]
+  autorisationsEnseignants AutorisationMatiere[]
 }
 
 model Enseignant {
@@ -84,9 +85,9 @@ model Enseignant {
   mot_de_passe  String
   est_actif     Boolean @default(true)
 
-  affectations AffectationCours[]
+  affectations         AffectationCours[]
+  autorisationsMatieres AutorisationMatiere[]
 }
-
 // --------------------------------------------------
 // 3. ADMINISTRATION
 // --------------------------------------------------
@@ -246,4 +247,24 @@ model VerrouillageNote {
   @@unique([id_affectation_cours, id_sequence])
   @@index([id_sequence])
   @@index([id_admin])
+}
+
+// --------------------------------------------------
+// 9. AUTORISATIONS DES ENSEIGNANTS PAR MATIÈRE
+// --------------------------------------------------
+// --------------------------------------------------
+// 9. AUTORISATIONS DES ENSEIGNANTS PAR MATIÈRE
+// --------------------------------------------------
+
+model AutorisationMatiere {
+  id_autorisation String @id @default(uuid()) @db.Uuid
+
+  id_enseignant String @db.Uuid
+  id_matiere    String @db.Uuid
+
+  enseignant Enseignant @relation(fields: [id_enseignant], references: [id_enseignant], onDelete: Restrict)
+  matiere    Matiere    @relation(fields: [id_matiere], references: [id_matiere], onDelete: Restrict)
+
+  @@unique([id_enseignant, id_matiere])
+  @@index([id_matiere])
 }

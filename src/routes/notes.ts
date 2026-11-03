@@ -82,6 +82,42 @@ app.get('/classes', async c => {
   if (!year) return error(c, 'Aucune année active');
   return c.json(await prisma.classe.findMany({ orderBy: { nom_classe: 'asc' } }));
 });
+
+app.get('/matieres', async c => {
+  return c.json(await prisma.matiere.findMany({
+    select: { id_matiere: true, libelle_matiere: true },
+    orderBy: { libelle_matiere: 'asc' }
+  }));
+});
+
+// Liste des enseignants actifs pour le formulaire de connexion.
+app.get('/enseignants', async c => {
+  const enseignants = await prisma.enseignant.findMany({
+    where: { est_actif: true },
+    select: { id_enseignant: true, nom_complet: true },
+    orderBy: { nom_complet: 'asc' }
+  });
+  return c.json(enseignants);
+});
+
+// Matières explicitement autorisées pour un enseignant.
+app.get('/enseignants/:id_enseignant/matieres', async c => {
+  const id = uuid.safeParse(c.req.param('id_enseignant'));
+  if (!id.success) return error(c, 'Enseignant invalide');
+
+  const enseignant = await prisma.enseignant.findFirst({
+    where: { id_enseignant: id.data, est_actif: true },
+    select: { id_enseignant: true }
+  });
+  if (!enseignant) return error(c, 'Enseignant introuvable ou inactif', 404);
+
+  const autorisations = await prisma.autorisationMatiere.findMany({
+    where: { id_enseignant: id.data },
+    include: { matiere: true },
+    orderBy: { matiere: { libelle_matiere: 'asc' } }
+  });
+  return c.json(autorisations.map(a => a.matiere));
+});
 app.get('/classes/:id_classe/matieres', async c => {
   const id = uuid.safeParse(c.req.param('id_classe'));
   if (!id.success) return error(c, 'Classe invalide');
@@ -91,14 +127,14 @@ app.get('/classes/:id_classe/matieres', async c => {
   return c.json(rows.map(a => ({ ...a.matiere, id_affectation_cours: a.id_affectation_cours, coefficient: num(a.coefficient) })));
 });
 app.get('/enseignants/filtres', async c => {
-  const q = z.object({ id_classe: uuid, id_matiere: uuid }).safeParse(c.req.query());
+  const q = z.object({ id_classe: uuid.optional(), id_matiere: uuid }).safeParse(c.req.query());
   if (!q.success) return error(c, 'Paramètres invalides');
-  const year = await activeYear();
-  if (!year) return error(c, 'Aucune année active');
-  const a = await getAssignment(q.data.id_matiere, q.data.id_classe, year.id_annee);
-  if (!a) return c.json([]);
-  const e = await prisma.enseignant.findUnique({ where: { id_enseignant: a.id_enseignant }, select: { id_enseignant: true, nom_complet: true, est_actif: true } });
-  return c.json(e?.est_actif ? [{ id_enseignant: e.id_enseignant, nom_complet: e.nom_complet }] : []);
+  const rows = await prisma.autorisationMatiere.findMany({
+    where: { id_matiere: q.data.id_matiere, enseignant: { est_actif: true } },
+    include: { enseignant: { select: { id_enseignant: true, nom_complet: true } } },
+    orderBy: { enseignant: { nom_complet: 'asc' } }
+  });
+  return c.json(rows.map(r => r.enseignant));
 });
 
 app.use('/notes/*', async (c, next) => {
@@ -116,12 +152,63 @@ app.use('/notes/*', async (c, next) => {
   } catch { return error(c, 'Session expirée ou invalide', 401); }
 });
 
+// Récupère le cours existant ou le crée pour l'enseignant connecté.
+// La création n'est possible que si la matière figure dans ses autorisations.
+async function resolveAuthorizedAssignment(c: any, id_matiere: string, id_classe: string, id_annee: string) {
+  const actor = c.get('actor') as { id: string; role: 'enseignant' | 'admin' };
+  let a = await getAssignment(id_matiere, id_classe, id_annee);
+
+  // L'administration conserve le fonctionnement historique : elle consulte
+  // les cours déjà créés et ne crée pas de cours au nom d'un enseignant.
+  if (actor.role === 'admin') {
+    if (!a) return { failure: error(c, 'Cours introuvable', 404) };
+    return { a };
+  }
+
+  const autorisation = await prisma.autorisationMatiere.findUnique({
+    where: { id_enseignant_id_matiere: { id_enseignant: actor.id, id_matiere } }
+  });
+  if (!autorisation) return { failure: error(c, 'Vous n’êtes pas autorisé à saisir les notes de cette matière.', 403) };
+
+  if (a) {
+    if (a.id_enseignant !== actor.id) {
+      return { failure: error(c, 'Ce cours est déjà attribué à un autre enseignant.', 403) };
+    }
+    return { a };
+  }
+
+  try {
+    a = await prisma.affectationCours.create({
+      data: {
+        id_enseignant: actor.id,
+        id_matiere,
+        id_classe,
+        id_annee,
+        coefficient: new Prisma.Decimal(1)
+      },
+      include: { matiere: true, classe: true }
+    });
+    return { a };
+  } catch (e) {
+    // En cas de création simultanée, relire le cours créé par l'autre requête.
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      const concurrent = await getAssignment(id_matiere, id_classe, id_annee);
+      if (concurrent?.id_enseignant === actor.id) return { a: concurrent };
+      if (concurrent) return { failure: error(c, 'Ce cours est déjà attribué à un autre enseignant.', 403) };
+    }
+    console.error('Création affectation cours', e);
+    return { failure: error(c, 'Impossible de préparer ce cours pour la saisie.', 400) };
+  }
+}
+
 async function resolveTarget(c: any, input: z.infer<typeof targetSchema>) {
   const year = await activeYear();
   if (!year) return { failure: error(c, 'Aucune année active') };
-  const a = await getAssignment(input.id_matiere, input.id_classe, year.id_annee);
-  if (!a) return { failure: error(c, 'Cours introuvable', 404) };
-  if (!isOwner(c.get('actor'), a)) return { failure: error(c, 'Accès refusé', 403) };
+  const assignment = await resolveAuthorizedAssignment(c, input.id_matiere, input.id_classe, year.id_annee);
+  if (assignment.failure) {
+  return { failure: assignment.failure };
+}
+  const a = assignment.a;
   const s = await getSequence(input.id_sequence, year.id_annee);
   if (!s) return { failure: error(c, 'Séquence introuvable', 404) };
   return { a, s, year };
@@ -190,8 +277,11 @@ async function grid(c: any) {
   const q = targetSchema.safeParse(c.req.query());
   if (!q.success) return error(c, 'Paramètres invalides');
   const target = await resolveTarget(c, q.data);
-  if ('failure' in target) return target.failure;
+  if (target.failure) return target.failure;
   const { a, s, year } = target;
+  if (!a || !s || !year) {
+  return error(c, 'Cours, séquence ou année scolaire introuvable.', 404);
+}
   const [students, grades, lock] = await Promise.all([
     prisma.affectationEleve.findMany({ where: { id_classe: a.id_classe, id_annee: year.id_annee }, include: { eleve: true }, orderBy: { eleve: { nom_complet: 'asc' } } }),
     prisma.note.findMany({ where: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } }),
@@ -219,9 +309,12 @@ app.post('/notes/sauvegarder', async c => {
   }
 
   const target = await resolveTarget(c, parsed.data);
-  if ('failure' in target) return target.failure;
+  if (target.failure) return target.failure;
 
   const { a, s, year } = target;
+  if (!a || !s || !year) {
+  return error(c, 'Cours, séquence ou année scolaire introuvable.', 404);
+}
   const ids = parsed.data.notes.map(n => n.id_eleve);
   const nouveauCoefficient = decimal(parsed.data.coefficient).toDecimalPlaces(2);
 
@@ -381,8 +474,11 @@ app.post('/notes/valider', async c => {
   const parsed = targetSchema.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return error(c, 'Données invalides');
   const target = await resolveTarget(c, parsed.data);
-  if ('failure' in target) return target.failure;
+  if (target.failure) return target.failure;
   const { a, s, year } = target;
+  if (!a || !s || !year) {
+  return error(c, 'Cours, séquence ou année scolaire introuvable.', 404);
+}
   try {
     const result = await prisma.$transaction(async tx => {
 await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_cours}), 0)`;
@@ -449,9 +545,20 @@ app.get('/notes/resultats-trimestriels', async c => {
   if (!q.success) return error(c, 'Paramètres invalides');
   const year = await activeYear();
   if (!year) return error(c, 'Aucune année active');
-  const a = await getAssignment(q.data.id_matiere, q.data.id_classe, year.id_annee);
-  if (!a) return error(c, 'Cours introuvable', 404);
-  if (!isOwner(c.get('actor'), a)) return error(c, 'Accès refusé', 403);
+const assignment = await resolveAuthorizedAssignment(
+  c,
+  q.data.id_matiere,
+  q.data.id_classe,
+  year.id_annee
+);
+
+if (assignment.failure) return assignment.failure;
+
+const a = assignment.a;
+
+if (!a) {
+  return error(c, 'Cours introuvable', 404);
+}
   const t = await prisma.trimestre.findFirst({
     where: { id_trimestre: q.data.id_trimestre, id_annee: year.id_annee },
     include: { sequences: { orderBy: { numero_sequence: 'asc' } } }
@@ -501,9 +608,11 @@ const trimestreTargetSchema = z.object({ id_classe: uuid, id_matiere: uuid, id_t
 async function resolveTrimestre(c: any, input: z.infer<typeof trimestreTargetSchema>) {
   const year = await activeYear();
   if (!year) return { failure: error(c, 'Aucune année active') };
-  const a = await getAssignment(input.id_matiere, input.id_classe, year.id_annee);
-  if (!a) return { failure: error(c, 'Cours introuvable', 404) };
-  if (!isOwner(c.get('actor'), a)) return { failure: error(c, 'Accès refusé', 403) };
+  const assignment = await resolveAuthorizedAssignment(c, input.id_matiere, input.id_classe, year.id_annee);
+  if (assignment.failure) {
+  return { failure: assignment.failure };
+}
+  const a = assignment.a;
   const t = await prisma.trimestre.findFirst({
     where: { id_trimestre: input.id_trimestre, id_annee: year.id_annee },
     include: { sequences: { orderBy: { numero_sequence: 'asc' } } }
@@ -520,8 +629,11 @@ app.get('/notes/grille-trimestre', async c => {
   const q = trimestreTargetSchema.safeParse(c.req.query());
   if (!q.success) return error(c, 'Paramètres invalides');
   const target = await resolveTrimestre(c, q.data);
-  if ('failure' in target) return target.failure;
+  if (target.failure) return target.failure;
   const { a, t, year, cc, eva } = target;
+  if (!a || !t || !year || !cc || !eva) {
+  return error(c, 'Données du trimestre incomplètes.', 404);
+}
 
   const [students, grades, locks] = await Promise.all([
     prisma.affectationEleve.findMany({
@@ -597,8 +709,11 @@ app.post('/notes/sauvegarder-trimestre', async c => {
   const parsed = sauvegardeTrimestreSchema.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: 'Données invalides', details: parsed.error.flatten() }, 400);
   const target = await resolveTrimestre(c, parsed.data);
-  if ('failure' in target) return target.failure;
+  if (target.failure) return target.failure;
   const { a, t, year, cc, eva } = target;
+  if (!a || !t || !year || !cc || !eva) {
+  return error(c, 'Données du trimestre incomplètes.', 404);
+}
   const ids = parsed.data.notes.map(n => n.id_eleve);
   const nouveauCoefficient = decimal(parsed.data.coefficient).toDecimalPlaces(2);
 
@@ -710,8 +825,11 @@ app.post('/notes/valider-trimestre', async c => {
     .safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return error(c, 'Données invalides');
   const target = await resolveTrimestre(c, parsed.data);
-  if ('failure' in target) return target.failure;
+  if (target.failure) return target.failure;
   const { a, t, year, cc, eva } = target;
+  if (!a || !t || !year || !cc || !eva) {
+  return error(c, 'Données du trimestre incomplètes.', 404);
+}
   const { parties } = parsed.data;
 
   try {
@@ -772,6 +890,50 @@ app.post('/notes/valider-trimestre', async c => {
     console.error('Validation trimestre', e);
     return error(c, 'Échec de validation');
   }
+});
+
+// ---------------------------------------------------------------------------
+// Administration des autorisations enseignant / matière
+// Ces routes sont protégées par le middleware JWT de /notes/*.
+// ---------------------------------------------------------------------------
+app.get('/notes/admin/autorisation-matieres', async c => {
+  if (c.get('actor').role !== 'admin') return error(c, 'Réservé à l’administration', 403);
+  const q = z.object({ id_enseignant: uuid.optional() }).safeParse(c.req.query());
+  if (!q.success) return error(c, 'Paramètres invalides');
+  const rows = await prisma.autorisationMatiere.findMany({
+    where: q.data.id_enseignant ? { id_enseignant: q.data.id_enseignant } : undefined,
+    include: {
+      enseignant: { select: { id_enseignant: true, nom_complet: true } },
+      matiere: { select: { id_matiere: true, libelle_matiere: true } }
+    },
+    orderBy: [{ enseignant: { nom_complet: 'asc' } }, { matiere: { libelle_matiere: 'asc' } }]
+  });
+  return c.json(rows);
+});
+
+app.post('/notes/admin/autorisation-matieres', async c => {
+  if (c.get('actor').role !== 'admin') return error(c, 'Réservé à l’administration', 403);
+  const parsed = z.object({ id_enseignant: uuid, id_matiere: uuid }).safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return error(c, 'Données invalides');
+  const [enseignant, matiere] = await Promise.all([
+    prisma.enseignant.findUnique({ where: { id_enseignant: parsed.data.id_enseignant }, select: { id_enseignant: true, est_actif: true } }),
+    prisma.matiere.findUnique({ where: { id_matiere: parsed.data.id_matiere }, select: { id_matiere: true } })
+  ]);
+  if (!enseignant?.est_actif || !matiere) return error(c, 'Enseignant actif ou matière introuvable', 404);
+  const autorisation = await prisma.autorisationMatiere.upsert({
+    where: { id_enseignant_id_matiere: parsed.data },
+    update: {},
+    create: parsed.data
+  });
+  return c.json({ success: true, autorisation });
+});
+
+app.delete('/notes/admin/autorisation-matieres', async c => {
+  if (c.get('actor').role !== 'admin') return error(c, 'Réservé à l’administration', 403);
+  const parsed = z.object({ id_enseignant: uuid, id_matiere: uuid }).safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return error(c, 'Données invalides');
+  const result = await prisma.autorisationMatiere.deleteMany({ where: parsed.data });
+  return c.json({ success: true, supprimee: result.count > 0 });
 });
 
 // ---------------------------------------------------------------------------
