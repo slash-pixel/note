@@ -1,11 +1,13 @@
 // src/index.ts — compatible avec src/routes/note.ts (ou notes.ts)
 import 'dotenv/config';
-import niveauxApp from './routes/niveaux.js';
 import { Hono } from 'hono';
 import { apiReference } from '@scalar/hono-api-reference';
 import { serve } from '@hono/node-server';
 import { cors } from 'hono/cors';
+import niveauxApp from './routes/niveaux.js';
 import notesApp from './routes/notes.js';
+import parentsApp from './routes/parents.js';
+import { notesStore } from './services/excelsParentsServices.js';
 const app = new Hono();
 // CORS : avec credentials=true, autoriser explicitement les origines du frontend (incluant Netlify et le développement local).
 const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? 'http://localhost:5173,http://localhost:3000,https://gesnotes.netlify.app')
@@ -19,6 +21,7 @@ app.use('/api/*', cors({
 app.get('/', c => c.json({ success: true, message: 'API de gestion scolaire active' }));
 app.route('/api', notesApp);
 app.route('/api', niveauxApp);
+app.route('/api', parentsApp);
 const uuid = { type: 'string', format: 'uuid' };
 const param = (name, where = 'query') => ({ name, in: where, required: true, schema: uuid });
 const jsonBody = (schema) => ({ required: true, content: { 'application/json': { schema } } });
@@ -36,9 +39,9 @@ const loginBody = jsonBody({
 app.get('/doc', c => c.json({
     openapi: '3.1.0',
     info: {
-        title: 'API Gestion Scolaire — Notes, NxC et Verrouillages',
-        version: '2.0.0',
-        description: 'Contrat des routes exposées par src/routes/note.ts. La validation verrouille les notes, tandis que l’administration peut rouvrir la saisie.',
+        title: 'API Gestion Scolaire — Notes, NxC, Verrouillages et Espace Parents',
+        version: '2.1.0',
+        description: 'Contrat des routes exposées par le backend scolaire, incluant la gestion des notes, des niveaux et la consultation directe des résultats par les parents à partir du matricule issu du fichier Excel.',
     },
     servers: [
         { url: 'http://localhost:3000', description: 'Développement local' },
@@ -49,13 +52,143 @@ app.get('/doc', c => c.json({
         schemas: {
             NoteInput: { type: 'object', properties: { id_eleve: uuid, valeur_note: { type: 'number', minimum: 0, maximum: 20, example: 15.5 } }, required: ['id_eleve', 'valeur_note'] },
             LigneGrille: { type: 'object', properties: { id_eleve: uuid, nom_complet: { type: 'string' }, valeur_note: { type: ['number', 'null'] }, note_x_coefficient: { type: ['number', 'null'] } } },
+            ParentNoteItem: {
+                type: 'object',
+                properties: {
+                    matiere: { type: 'string', example: 'MATHEMATIQUES (Ecrite)' },
+                    trimestre: { type: 'string', example: '1er trimestre' },
+                    coefficient: { type: 'number', example: 4 },
+                    moyenneInterro: { type: 'number', example: 13.5 },
+                    devoir1: { type: 'number', example: 14 },
+                    devoir2: { type: 'number', example: 12 },
+                    composition: { type: 'number', example: 15 },
+                    moyenneGenerale: { type: 'number', example: 14.2 },
+                    moyenneCoef: { type: 'number', example: 56.8 },
+                    rang: { type: 'string', example: '2e' },
+                    mention: { type: 'string', example: 'Bien' },
+                    familleMatiere: { type: 'string', example: 'Matières scientifiques' },
+                    anneeScolaire: { type: 'string', example: '2026 - 2027' },
+                },
+            },
+            ParentStudentResult: {
+                type: 'object',
+                properties: {
+                    codeeleve: { type: 'string', example: '565' },
+                    matricule: { type: 'string', example: '250143811' },
+                    nomEleve: { type: 'string', example: 'ENENGUE  ISMAËL' },
+                    anneeScolaire: { type: 'string', example: '2026 - 2027' },
+                    totalNotes: { type: 'number', example: 40 },
+                    notes: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/ParentNoteItem' },
+                    },
+                },
+            },
         },
     },
     tags: [
-        { name: 'Configuration' }, { name: 'Authentification' }, { name: 'Notes' },
-        { name: 'Résultats trimestriels' }, { name: 'Administration' },
+        { name: 'Parents', description: 'Consultation des résultats scolaires par les parents d’élèves' },
+        { name: 'Configuration' },
+        { name: 'Authentification' },
+        { name: 'Notes' },
+        { name: 'Résultats trimestriels' },
+        { name: 'Administration' },
     ],
     paths: {
+        '/api/parents/notes': {
+            get: {
+                tags: ['Parents'],
+                summary: 'Consulter les notes d’un élève (par matricule ou nom)',
+                description: 'Permet à un parent de saisir le matricule de son enfant (ou son code élève) extrait du fichier Excel de notes afin de voir l’intégralité de ses résultats scolaires (matières, coefficients, interrogations, devoirs, compositions, moyennes et rangs).',
+                parameters: [
+                    {
+                        name: 'matricule',
+                        in: 'query',
+                        required: false,
+                        description: 'Matricule officiel de l’élève ou code élève (ex: 250143811 ou 480)',
+                        schema: { type: 'string', example: '250143811' },
+                    },
+                    {
+                        name: 'nom',
+                        in: 'query',
+                        required: false,
+                        description: 'Nom de l’élève pour recherche partielle (ex: ENENGUE)',
+                        schema: { type: 'string', example: 'ENENGUE' },
+                    },
+                    {
+                        name: 'q',
+                        in: 'query',
+                        required: false,
+                        description: 'Terme de recherche global (matricule ou nom)',
+                        schema: { type: 'string', example: '250143811' },
+                    },
+                ],
+                responses: {
+                    '200': {
+                        description: 'Résultats scolaires de l’élève trouvés',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: true },
+                                        data: { $ref: '#/components/schemas/ParentStudentResult' },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    '400': response('Paramètre matricule ou nom manquant'),
+                    '404': response('Aucun élève trouvé pour ce matricule/nom'),
+                    '503': response('Fichier Excel en cours d’initialisation en mémoire'),
+                },
+            },
+        },
+        '/api/parents/notes/{matricule}': {
+            get: {
+                tags: ['Parents'],
+                summary: 'Consulter directement les notes via l’URL (par matricule)',
+                description: 'Accès direct et immédiat aux résultats de l’enfant en spécifiant son matricule directement dans le chemin de l’URL (ex: /api/parents/notes/250143811).',
+                parameters: [
+                    {
+                        name: 'matricule',
+                        in: 'path',
+                        required: true,
+                        description: 'Matricule officiel de l’élève ou code élève (ex: 250143811 ou 480)',
+                        schema: { type: 'string', example: '250143811' },
+                    },
+                ],
+                responses: {
+                    '200': {
+                        description: 'Résultats scolaires de l’élève trouvés',
+                        content: {
+                            'application/json': {
+                                schema: {
+                                    type: 'object',
+                                    properties: {
+                                        success: { type: 'boolean', example: true },
+                                        data: { $ref: '#/components/schemas/ParentStudentResult' },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    '400': response('Matricule invalide ou manquant'),
+                    '404': response('Aucun élève trouvé pour ce matricule'),
+                    '503': response('Fichier Excel en cours d’initialisation en mémoire'),
+                },
+            },
+        },
+        '/api/parents/status': {
+            get: {
+                tags: ['Parents'],
+                summary: 'État du chargement du fichier Excel en mémoire',
+                description: 'Permet de vérifier le nombre d’élèves indexés, le nombre total de notes et le chemin du fichier Excel chargé.',
+                responses: {
+                    '200': response('Statut du store et informations de mémoire'),
+                },
+            },
+        },
         '/api/trimestres': { get: { tags: ['Configuration'], summary: 'Trimestres et séquences de l’année active', responses: { '200': response('Liste des trimestres'), '400': response('Aucune année active') } } },
         '/api/sequences': { get: { tags: ['Configuration'], summary: 'Séquences regroupées par trimestre', responses: { '200': response('Trimestres, libellés et séquences'), '400': response('Aucune année active') } } },
         '/api/classes': { get: { tags: ['Configuration'], summary: 'Classes ayant une affectation de cours pour l’année active', responses: { '200': response('Liste des classes'), '400': response('Aucune année active') } } },
@@ -72,7 +205,19 @@ app.get('/doc', c => c.json({
         '/api/notes/admin/deverrouiller': { post: { tags: ['Administration'], summary: 'Rouvrir la saisie d’un cours pour une séquence', security: auth, requestBody: jsonBody({ type: 'object', properties: { id_affectation_cours: uuid, id_sequence: uuid }, required: ['id_affectation_cours', 'id_sequence'] }), responses: { '200': response('Saisie rouverte'), ...restricted } } },
     },
 }));
-app.get('/reference', apiReference({ url: '/doc', pageTitle: 'Documentation API scolaire — Notes', theme: 'purple' }));
+app.get('/reference', apiReference({
+    url: '/doc',
+    pageTitle: 'Documentation API scolaire — Notes & Espace Parents',
+    theme: 'purple',
+}));
+// Chargement du fichier Excel de notes en mémoire au démarrage du serveur
+const excelFilePath = process.env.EXCEL_NOTES_PATH || 'Notes_au_06_11_2026.xlsx';
+try {
+    await notesStore.loadExcel(excelFilePath);
+}
+catch (error) {
+    console.error(`⚠️ Avertissement : Impossible de précharger le fichier Excel "${excelFilePath}" :`, error);
+}
 const port = Number(process.env.PORT) || 3000;
 serve({ fetch: app.fetch, port });
 console.log(`🚀 API : http://localhost:${port}`);
