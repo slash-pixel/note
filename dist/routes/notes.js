@@ -954,10 +954,12 @@ app.post('/dashboard/login', async (c) => {
 // Toutes les autres routes /dashboard/* exigent ce jeton (enseignants exclus)
 app.use('/dashboard/*', async (c, next) => {
     const header = c.req.header('Authorization') || '';
-    if (!/^Bearer \S+$/.test(header))
+    const queryToken = c.req.query('token');
+    const token = /^Bearer \S+$/.test(header) ? header.slice(7) : queryToken;
+    if (!token)
         return error(c, 'Token manquant', 401);
     try {
-        const p = await verify(header.slice(7), secret, 'HS256');
+        const p = await verify(token, secret, 'HS256');
         if (p.role !== 'dashboard')
             return error(c, 'Token invalide', 401);
     }
@@ -968,7 +970,7 @@ app.use('/dashboard/*', async (c, next) => {
 });
 // ---------------------------------------------------------------------------
 // NOMENCLATURE DES FICHIERS (le seul endroit à modifier pour changer le nom)
-// Exemple : NOTES_2026-2027_6EME-M-1_MATHEMATIQUES_T1-CC_VALIDE.xlsx
+// Exemple : NOTES_2026-2027_6EME-M-1_MATHEMATIQUES_T1_VALIDE.xlsx
 // ---------------------------------------------------------------------------
 const slug = (v) => v
     .normalize('NFD')
@@ -976,7 +978,10 @@ const slug = (v) => v
     .replace(/[^A-Za-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .toUpperCase();
-const buildFileName = (p) => `NOTES_${slug(p.annee)}_${slug(p.classe)}_${slug(p.matiere)}_T${p.trimestre}-${p.partie === 'cc' ? 'CC' : 'EVA'}_${p.verrouille ? 'VALIDE' : 'BROUILLON'}.xlsx`;
+const buildFileName = (p) => {
+    const suffixe = p.partie === 'cc' ? '-CC' : p.partie === 'eva' ? '-EVA' : '';
+    return `NOTES_${slug(p.annee)}_${slug(p.classe)}_${slug(p.matiere)}_T${p.trimestre}${suffixe}_${p.verrouille ? 'VALIDE' : 'BROUILLON'}.xlsx`;
+};
 // ---------------------------------------------------------------------------
 // Dashboard : tous les fichiers de notes enregistrés (brouillon) ou verrouillés
 // ---------------------------------------------------------------------------
@@ -1060,8 +1065,208 @@ app.get('/dashboard/liste', async (c) => {
         x.sequence - y.sequence);
     return c.json({ annee: year.libelle_annee, rows });
 });
+async function buildWorkbookNotes(params) {
+    const { affectation: a, trimestre: t, annee: year } = params;
+    const { cc, eva } = rolesTrimestre(t);
+    const seqIds = [cc?.id_sequence, eva?.id_sequence].filter(Boolean);
+    const [students, grades, locks] = await Promise.all([
+        prisma.affectationEleve.findMany({
+            where: { id_classe: a.id_classe, id_annee: year.id_annee },
+            include: { eleve: true },
+            orderBy: { eleve: { nom_complet: 'asc' } }
+        }),
+        prisma.note.findMany({
+            where: {
+                id_affectation_cours: a.id_affectation_cours,
+                id_sequence: { in: seqIds }
+            }
+        }),
+        prisma.verrouillageNote.findMany({
+            where: {
+                id_affectation_cours: a.id_affectation_cours,
+                id_sequence: { in: seqIds }
+            }
+        })
+    ]);
+    const notesCC = new Map();
+    const notesEva = new Map();
+    for (const n of grades) {
+        if (cc && n.id_sequence === cc.id_sequence) {
+            notesCC.set(n.id_eleve, num(n.valeur_note));
+        }
+        else if (eva && n.id_sequence === eva.id_sequence) {
+            notesEva.set(n.id_eleve, num(n.valeur_note));
+        }
+    }
+    const lockCC = cc ? locks.find(l => l.id_sequence === cc.id_sequence && l.est_verrouille) : null;
+    const lockEva = eva ? locks.find(l => l.id_sequence === eva.id_sequence && l.est_verrouille) : null;
+    const estVerrouilleCC = Boolean(lockCC);
+    const estVerrouilleEva = Boolean(lockEva);
+    const toutVerrouille = Boolean(cc && eva && estVerrouilleCC && estVerrouilleEva);
+    let statutTexte = 'Brouillon (non validé)';
+    if (toutVerrouille) {
+        const dates = [lockCC?.date_verrouillage, lockEva?.date_verrouillage].filter(Boolean);
+        const dateMax = dates.length ? new Date(Math.max(...dates.map(d => d.getTime()))) : null;
+        statutTexte = `Validé et verrouillé${dateMax ? ` le ${dateMax.toLocaleDateString('fr-FR')}` : ''}`;
+    }
+    else if (estVerrouilleCC && !estVerrouilleEva) {
+        statutTexte = '1re éval. (30 %) validée, Éval. harmonisée (70 %) en brouillon';
+    }
+    else if (!estVerrouilleCC && estVerrouilleEva) {
+        statutTexte = '1re éval. (30 %) en brouillon, Éval. harmonisée (70 %) validée';
+    }
+    const coefficient = num(a.coefficient);
+    const NAVY = 'FF0B1F4B';
+    const GOLD = 'FFC9A227';
+    const thin = { style: 'thin', color: { argb: 'FFB8C2D6' } };
+    const border = { top: thin, left: thin, bottom: thin, right: thin };
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'Collège Catholique Saint Charles Borromée';
+    wb.created = new Date();
+    const ws = wb.addWorksheet(`Notes T${t.numero_trimestre}`);
+    ws.columns = [
+        { width: 8 }, // A: N°
+        { width: 44 }, // B: Nom et prénom(s) de l'élève
+        { width: 20 }, // C: 1re Évaluation (30 %)
+        { width: 24 }, // D: Évaluation harmonisée (70 %)
+        { width: 24 }, // E: Note finale / Moyenne (100 %)
+        { width: 20 } // F: Note × Coef
+    ];
+    ws.pageSetup = { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
+    // En-tête de l'établissement
+    ws.mergeCells('A1:F1');
+    ws.getCell('A1').value = 'COLLÈGE CATHOLIQUE SAINT CHARLES BORROMÉE';
+    ws.getCell('A1').font = { bold: true, size: 14, color: { argb: NAVY } };
+    ws.getCell('A1').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(1).height = 28;
+    ws.mergeCells('A2:F2');
+    ws.getCell('A2').value = `Relevé des notes — Trimestre ${t.numero_trimestre}`;
+    ws.getCell('A2').font = { bold: true, size: 11, color: { argb: GOLD } };
+    ws.getCell('A2').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(2).height = 20;
+    // Métadonnées du cours
+    const info = [
+        ['Année scolaire', year.libelle_annee],
+        ['Classe', a.classe.nom_classe],
+        ['Matière', a.matiere.libelle_matiere],
+        ['Enseignant', a.enseignant.nom_complet],
+        ['Coefficient', String(coefficient)],
+        ['Statut', statutTexte]
+    ];
+    info.forEach(([label, value], i) => {
+        const r = 4 + i;
+        ws.mergeCells(`A${r}:F${r}`);
+        ws.getCell(`A${r}`).value = { richText: [{ text: `${label} : `, font: { bold: true } }, { text: value }] };
+        ws.getRow(r).height = 18;
+    });
+    // En-tête des colonnes du tableau
+    const HEADER_ROW = 11;
+    const header = ws.getRow(HEADER_ROW);
+    const libelleColCC = cc ? `${libelleCC(t.numero_trimestre)} (30 %)` : 'Éval. continue (30 %)';
+    const libelleColEva = eva ? `${libelleEva(t.numero_trimestre)} (70 %)` : 'Éva harmonisée (70 %)';
+    header.values = [
+        'N°',
+        'Nom et prénom(s) de l’élève',
+        libelleColCC,
+        libelleColEva,
+        'Moyenne trimestrielle (100 %)',
+        `Note × Coef (${coefficient})`
+    ];
+    header.height = 26;
+    header.eachCell(cell => {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        cell.border = border;
+    });
+    ws.views = [{ state: 'frozen', ySplit: HEADER_ROW }];
+    let countCC = 0;
+    let countEva = 0;
+    let countMoyennes = 0;
+    let sumMoyennes = 0;
+    students.forEach(({ eleve }, i) => {
+        const nCC = notesCC.get(eleve.id_eleve) ?? null;
+        const nEva = notesEva.get(eleve.id_eleve) ?? null;
+        if (nCC !== null)
+            countCC++;
+        if (nEva !== null)
+            countEva++;
+        let moyTrim = null;
+        let moyNxC = null;
+        if (nCC !== null && nEva !== null) {
+            const calc = calculerTrimestre(decimal(nCC), decimal(nEva), a.coefficient);
+            if (calc) {
+                moyTrim = num(calc.moyenne);
+                moyNxC = num(calc.moyenneXCoef);
+                sumMoyennes += moyTrim;
+                countMoyennes++;
+            }
+        }
+        const rowNum = HEADER_ROW + 1 + i;
+        const row = ws.addRow([
+            i + 1,
+            eleve.nom_complet,
+            nCC,
+            nEva,
+            moyTrim,
+            moyNxC
+        ]);
+        row.height = 20;
+        row.getCell(1).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(2).alignment = { horizontal: 'left', vertical: 'middle' };
+        row.getCell(3).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(4).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(5).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(6).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(3).numFmt = '0.00';
+        row.getCell(4).numFmt = '0.00';
+        row.getCell(5).numFmt = '0.00';
+        row.getCell(6).numFmt = '0.00';
+        row.getCell(5).font = { bold: true, color: { argb: 'FF1E293B' } };
+        row.getCell(6).font = { bold: true, color: { argb: 'FF1E293B' } };
+        // Si les deux notes sont présentes, associer les formules dynamiques avec résultat calculé
+        if (nCC !== null && nEva !== null) {
+            row.getCell(5).value = {
+                formula: `ROUND(C${rowNum}*0.3 + D${rowNum}*0.7, 2)`,
+                result: moyTrim
+            };
+            row.getCell(6).value = {
+                formula: `ROUND(E${rowNum}*${coefficient}, 2)`,
+                result: moyNxC
+            };
+        }
+        row.eachCell({ includeEmpty: true }, cell => { cell.border = border; });
+    });
+    // Statistiques et pied de page
+    ws.addRow([]);
+    const moyenneClasse = countMoyennes > 0 ? (sumMoyennes / countMoyennes).toFixed(2) : '—';
+    [
+        `Effectif total : ${students.length} élève(s)`,
+        `Notes saisies — ${libelleColCC} : ${countCC} / ${students.length}`,
+        `Notes saisies — ${libelleColEva} : ${countEva} / ${students.length}`,
+        `Moyennes trimestrielles calculées : ${countMoyennes} / ${students.length}`,
+        `Moyenne générale de la classe : ${moyenneClasse} / 20 (avant coefficient)`,
+        `Exporté le ${new Date().toLocaleString('fr-FR')}`
+    ].forEach(text => {
+        const r = ws.addRow([text]);
+        ws.mergeCells(`A${r.number}:F${r.number}`);
+        r.font = { bold: true, size: 9, color: { argb: 'FF334155' } };
+        r.height = 18;
+    });
+    const fileName = buildFileName({
+        annee: year.libelle_annee,
+        classe: a.classe.nom_classe,
+        matiere: a.matiere.libelle_matiere,
+        trimestre: t.numero_trimestre,
+        partie: 'trimestre',
+        verrouille: toutVerrouille
+    });
+    const buffer = await wb.xlsx.writeBuffer();
+    return { buffer, fileName };
+}
 // ---------------------------------------------------------------------------
-// Export Excel d'un fichier de notes (un cours + une séquence)
+// Export Excel d'un fichier de notes trimestrielles (Dashboard)
+// Endpoint existant appelé par le Frontend : id_affectation_cours & id_sequence
 // ---------------------------------------------------------------------------
 app.get('/dashboard/export', async (c) => {
     const q = adminTargetSchema.safeParse(c.req.query());
@@ -1079,107 +1284,7 @@ app.get('/dashboard/export', async (c) => {
     ]);
     if (!a || !s)
         return error(c, 'Cours ou séquence introuvable', 404);
-    const [students, grades, lock] = await Promise.all([
-        prisma.affectationEleve.findMany({
-            where: { id_classe: a.id_classe, id_annee: year.id_annee },
-            include: { eleve: true },
-            orderBy: { eleve: { nom_complet: 'asc' } }
-        }),
-        prisma.note.findMany({ where: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } }),
-        prisma.verrouillageNote.findUnique({
-            where: { id_affectation_cours_id_sequence: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } }
-        })
-    ]);
-    const verrouille = lock?.est_verrouille ?? false;
-    const byId = new Map(grades.map(n => [n.id_eleve, n]));
-    const coefficient = num(a.coefficient);
-    const NAVY = 'FF0B1F4B';
-    const GOLD = 'FFC9A227';
-    const thin = { style: 'thin', color: { argb: 'FFB8C2D6' } };
-    const border = { top: thin, left: thin, bottom: thin, right: thin };
-    const wb = new ExcelJS.Workbook();
-    wb.creator = 'Collège Catholique Saint Charles Borromée';
-    wb.created = new Date();
-    const ws = wb.addWorksheet('Notes');
-    ws.columns = [{ width: 8 }, { width: 46 }, { width: 14 }, { width: 20 }];
-    ws.pageSetup = { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
-    ws.mergeCells('A1:D1');
-    ws.getCell('A1').value = 'COLLÈGE CATHOLIQUE SAINT CHARLES BORROMÉE';
-    ws.getCell('A1').font = { bold: true, size: 14, color: { argb: NAVY } };
-    ws.getCell('A1').alignment = { horizontal: 'center' };
-    ws.mergeCells('A2:D2');
-    const partie = s.trimestre.sequences
-        .slice()
-        .sort((x, y) => x.numero_sequence - y.numero_sequence)
-        .findIndex(x => x.id_sequence === s.id_sequence) === 0 ? 'cc' : 'eva';
-    const libellePartie = partie === 'cc' ? `CC${s.trimestre.numero_trimestre} (30 %)` : `Éva de niveau ${s.trimestre.numero_trimestre} (70 %)`;
-    ws.getCell('A2').value = `Relevé de notes, ${libellePartie}`;
-    ws.getCell('A2').font = { bold: true, size: 11, color: { argb: GOLD } };
-    ws.getCell('A2').alignment = { horizontal: 'center' };
-    const dateVerrou = lock?.date_verrouillage ? lock.date_verrouillage.toLocaleDateString('fr-FR') : null;
-    const info = [
-        ['Année scolaire', year.libelle_annee],
-        ['Classe', a.classe.nom_classe],
-        ['Matière', a.matiere.libelle_matiere],
-        ['Enseignant', a.enseignant.nom_complet],
-        ['Coefficient', String(coefficient)],
-        ['Statut', verrouille ? `Validé et verrouillé${dateVerrou ? ` le ${dateVerrou}` : ''}` : 'Brouillon (non validé)']
-    ];
-    info.forEach(([label, value], i) => {
-        const r = 4 + i;
-        ws.mergeCells(`A${r}:D${r}`);
-        ws.getCell(`A${r}`).value = { richText: [{ text: `${label} : `, font: { bold: true } }, { text: value }] };
-    });
-    const HEADER_ROW = 11;
-    const header = ws.getRow(HEADER_ROW);
-    header.values = ['N°', 'Nom et prénom(s) de l’élève', 'Note / 20', 'Contribution au trimestre'];
-    header.height = 22;
-    header.eachCell(cell => {
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-        cell.border = border;
-    });
-    ws.views = [{ state: 'frozen', ySplit: HEADER_ROW }];
-    let sum = 0;
-    let count = 0;
-    students.forEach(({ eleve }, i) => {
-        const n = byId.get(eleve.id_eleve);
-        const note = n ? num(n.valeur_note) : null;
-        const poids = partie === 'cc' ? 0.30 : 0.70;
-        const contribution = note === null ? null : Number((note * poids).toFixed(2));
-        if (contribution !== null) {
-            sum += contribution;
-            count += 1;
-        }
-        const row = ws.addRow([i + 1, eleve.nom_complet, note, contribution]);
-        row.getCell(1).alignment = { horizontal: 'center' };
-        row.getCell(3).alignment = { horizontal: 'center' };
-        row.getCell(4).alignment = { horizontal: 'center' };
-        row.getCell(3).numFmt = '0.00';
-        row.getCell(4).numFmt = '0.00';
-        row.eachCell({ includeEmpty: true }, cell => { cell.border = border; });
-    });
-    ws.addRow([]);
-    [
-        `Effectif : ${students.length}`,
-        `Notes saisies : ${count} / ${students.length}`,
-        `Contribution moyenne de la classe : ${count ? (sum / count).toFixed(2) : '—'} / 20 (avant coefficient)`,
-        `Exporté le ${new Date().toLocaleString('fr-FR')}`
-    ].forEach(text => {
-        const r = ws.addRow([text]);
-        ws.mergeCells(`A${r.number}:D${r.number}`);
-        r.font = { bold: true };
-    });
-    const fileName = buildFileName({
-        annee: year.libelle_annee,
-        classe: a.classe.nom_classe,
-        matiere: a.matiere.libelle_matiere,
-        trimestre: s.trimestre.numero_trimestre,
-        partie,
-        verrouille
-    });
-    const buffer = await wb.xlsx.writeBuffer();
+    const { buffer, fileName } = await buildWorkbookNotes({ affectation: a, trimestre: s.trimestre, annee: year });
     return c.body(new Uint8Array(buffer), 200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         'Content-Disposition': `attachment; filename="${fileName}"`
