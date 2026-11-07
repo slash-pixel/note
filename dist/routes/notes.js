@@ -1,7 +1,6 @@
 import { Hono } from 'hono';
 import { Prisma, PrismaClient } from '@prisma/client';
 import ExcelJS from 'exceljs';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { sign, verify } from 'hono/jwt';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
@@ -11,7 +10,8 @@ const secret = process.env.JWT_SECRET;
 if (!secret || secret.length < 32)
     throw new Error('JWT_SECRET doit contenir au moins 32 caractères');
 const uuid = z.string().uuid();
-const authSchema = z.object({ id_enseignant: uuid.optional(), id_admin: uuid.optional(), mot_de_passe: z.string().min(1) });
+const enseignantLoginSchema = z.object({ id_enseignant: uuid, mot_de_passe: z.string().min(1) });
+const adminLoginSchema = z.object({ email: z.string().email(), mot_de_passe: z.string().min(1) });
 const targetSchema = z.object({ id_classe: uuid, id_matiere: uuid, id_sequence: uuid });
 const notesSchema = targetSchema.extend({
     coefficient: z.number().finite().min(0.01).max(99.99),
@@ -32,25 +32,35 @@ const error = (c, message, status = 400) => c.json({ error: message }, status);
 const activeYear = () => prisma.anneeScolaire.findFirst({ where: { est_active: true } });
 const getAssignment = (id_matiere, id_classe, id_annee) => prisma.affectationCours.findUnique({ where: { id_matiere_id_classe_id_annee: { id_matiere, id_classe, id_annee } }, include: { matiere: true, classe: true } });
 const getSequence = (id_sequence, id_annee) => prisma.sequence.findFirst({ where: { id_sequence, trimestre: { id_annee } }, include: { trimestre: { include: { sequences: { orderBy: { numero_sequence: 'asc' } } } } } });
-const isOwner = (actor, assignment) => actor.role === 'admin' || actor.id === assignment.id_enseignant;
-async function login(c, role) {
-    const body = authSchema.safeParse(await c.req.json().catch(() => null));
+// ---------------------------------------------------------------------------
+// Authentification
+// ---------------------------------------------------------------------------
+// Enseignant : toujours par id_enseignant (choisi dans une liste côté frontend) + mot de passe.
+app.post('/auth/login', async (c) => {
+    const body = enseignantLoginSchema.safeParse(await c.req.json().catch(() => null));
     if (!body.success)
         return error(c, 'Données de connexion invalides', 400);
-    const id = role === 'admin' ? body.data.id_admin : body.data.id_enseignant;
-    if (!id)
-        return error(c, 'Identifiant manquant ou invalide', 400);
-    const person = role === 'admin'
-        ? await prisma.administrateur.findUnique({ where: { id_admin: id } })
-        : await prisma.enseignant.findUnique({ where: { id_enseignant: id } });
-    if (!person || !person.est_actif || !(await bcrypt.compare(body.data.mot_de_passe, person.mot_de_passe))) {
+    const enseignant = await prisma.enseignant.findUnique({ where: { id_enseignant: body.data.id_enseignant } });
+    if (!enseignant || !enseignant.est_actif || !(await bcrypt.compare(body.data.mot_de_passe, enseignant.mot_de_passe))) {
         return error(c, 'Identifiants incorrects ou compte inactif', 401);
     }
-    const token = await sign({ sub: id, role, exp: Math.floor(Date.now() / 1000) + 4 * 3600 }, secret, 'HS256');
-    return c.json({ token, role, nom_complet: person.nom_complet, message: 'Connexion réussie' });
-}
-app.post('/auth/login', c => login(c, 'enseignant'));
-app.post('/admin/auth/login', c => login(c, 'admin'));
+    const token = await sign({ sub: enseignant.id_enseignant, role: 'enseignant', exp: Math.floor(Date.now() / 1000) + 4 * 3600 }, secret, 'HS256');
+    return c.json({ token, role: 'enseignant', nom_complet: enseignant.nom_complet, message: 'Connexion réussie' });
+});
+// Administrateur : désormais par email + mot de passe. Ce même compte sert à la fois
+// pour le déverrouillage des notes (/notes/admin/*) et pour le dashboard (/dashboard/*).
+app.post('/admin/auth/login', async (c) => {
+    const body = adminLoginSchema.safeParse(await c.req.json().catch(() => null));
+    if (!body.success)
+        return error(c, 'Données de connexion invalides', 400);
+    const email = body.data.email.trim().toLowerCase();
+    const admin = await prisma.administrateur.findUnique({ where: { email } });
+    if (!admin || !admin.est_actif || !(await bcrypt.compare(body.data.mot_de_passe, admin.mot_de_passe))) {
+        return error(c, 'Identifiants incorrects ou compte inactif', 401);
+    }
+    const token = await sign({ sub: admin.id_admin, role: 'admin', exp: Math.floor(Date.now() / 1000) + 4 * 3600 }, secret, 'HS256');
+    return c.json({ token, role: 'admin', nom_complet: admin.nom_complet, email: admin.email, message: 'Connexion réussie' });
+});
 app.get('/trimestres', async (c) => {
     const year = await activeYear();
     if (!year)
@@ -96,7 +106,7 @@ app.get('/enseignants', async (c) => {
     });
     return c.json(enseignants);
 });
-// Matières explicitement autorisées pour un enseignant.
+// Matières explicitement autorisées pour un enseignant (= ce qu'il a le droit de voir/saisir).
 app.get('/enseignants/:id_enseignant/matieres', async (c) => {
     const id = uuid.safeParse(c.req.param('id_enseignant'));
     if (!id.success)
@@ -919,56 +929,91 @@ app.delete('/notes/admin/autorisation-matieres', async (c) => {
     return c.json({ success: true, supprimee: result.count > 0 });
 });
 // ---------------------------------------------------------------------------
-// Dashboard sécurisé par mot de passe
+// Dashboard
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Accès au dashboard : un simple mot de passe partagé (DASHBOARD_PASSWORD)
-// ---------------------------------------------------------------------------
-const dashboardPassword = process.env.DASHBOARD_PASSWORD;
-const safeEqual = (a, b) => timingSafeEqual(createHash('sha256').update(a).digest(), createHash('sha256').update(b).digest());
-// Limite les essais : 8 erreurs par 15 minutes et par adresse IP
-const attempts = new Map();
-const clientIp = (c) => String(c.req.header('x-forwarded-for') || 'local').split(',')[0].trim();
-app.post('/dashboard/login', async (c) => {
-    if (!dashboardPassword || dashboardPassword.length < 8) {
-        return c.json({ error: 'Accès au tableau de bord non configuré sur le serveur' }, 503);
-    }
-    const ip = clientIp(c);
-    const now = Date.now();
-    const entry = attempts.get(ip);
-    const active = entry && entry.resetAt > now ? entry : null;
-    if (active && active.count >= 8) {
-        return c.json({ error: 'Trop de tentatives. Réessayez dans quelques minutes.' }, 429);
-    }
-    const body = z.object({ mot_de_passe: z.string().min(1) }).safeParse(await c.req.json().catch(() => null));
-    if (!body.success)
-        return error(c, 'Mot de passe requis');
-    if (!safeEqual(body.data.mot_de_passe, dashboardPassword)) {
-        attempts.set(ip, active ? { ...active, count: active.count + 1 } : { count: 1, resetAt: now + 15 * 60 * 1000 });
-        return error(c, 'Mot de passe incorrect', 401);
-    }
-    attempts.delete(ip);
-    const token = await sign({ role: 'dashboard', exp: Math.floor(now / 1000) + 4 * 3600 }, secret, 'HS256');
-    return c.json({ token });
-});
-// Toutes les autres routes /dashboard/* exigent ce jeton (enseignants exclus)
+// Accès au dashboard désormais via le MÊME compte administrateur (email + mot de passe,
+// obtenu via POST /admin/auth/login) que celui utilisé pour déverrouiller les notes.
+// Il n'y a donc plus de mot de passe partagé séparé pour le dashboard.
 app.use('/dashboard/*', async (c, next) => {
     const header = c.req.header('Authorization') || '';
-    if (!/^Bearer \S+$/.test(header))
+    const queryToken = c.req.query('token');
+    const token = /^Bearer \S+$/.test(header) ? header.slice(7) : queryToken;
+    if (!token)
         return error(c, 'Token manquant', 401);
     try {
-        const p = await verify(header.slice(7), secret, 'HS256');
-        if (p.role !== 'dashboard')
+        const p = await verify(token, secret, 'HS256');
+        if (p.role !== 'admin' || typeof p.sub !== 'string' || !uuid.safeParse(p.sub).success) {
             return error(c, 'Token invalide', 401);
+        }
+        const admin = await prisma.administrateur.findUnique({ where: { id_admin: p.sub }, select: { est_actif: true } });
+        if (!admin?.est_actif)
+            return error(c, 'Compte administrateur inactif', 403);
+        c.set('actor', { id: p.sub, role: 'admin' });
     }
     catch {
         return error(c, 'Session expirée ou invalide', 401);
     }
     await next();
 });
+// Profil de l'administrateur connecté : consultation et mise à jour (email, mot de passe, nom).
+// L'id_admin n'est jamais modifiable depuis cette route (c'est la clé primaire).
+app.get('/dashboard/profil', async (c) => {
+    const { id } = c.get('actor');
+    const admin = await prisma.administrateur.findUnique({
+        where: { id_admin: id },
+        select: { id_admin: true, email: true, nom_complet: true, est_actif: true }
+    });
+    if (!admin)
+        return error(c, 'Administrateur introuvable', 404);
+    return c.json(admin);
+});
+const profilAdminSchema = z.object({
+    email: z.string().email().optional(),
+    mot_de_passe: z.string().min(8, 'Le mot de passe doit contenir au moins 8 caractères').optional(),
+    mot_de_passe_actuel: z.string().min(1).optional(),
+    nom_complet: z.string().min(1).optional()
+}).refine(v => v.email || v.mot_de_passe || v.nom_complet, { message: 'Aucune modification fournie' });
+app.put('/dashboard/profil', async (c) => {
+    const { id } = c.get('actor');
+    const body = profilAdminSchema.safeParse(await c.req.json().catch(() => null));
+    if (!body.success)
+        return c.json({ error: 'Données invalides', details: body.error.flatten() }, 400);
+    const admin = await prisma.administrateur.findUnique({ where: { id_admin: id } });
+    if (!admin)
+        return error(c, 'Administrateur introuvable', 404);
+    // Changer le mot de passe ou l'email exige de reconfirmer le mot de passe actuel,
+    // pour éviter qu'une session volée ne verrouille le vrai titulaire du compte.
+    if (body.data.mot_de_passe || body.data.email) {
+        if (!body.data.mot_de_passe_actuel || !(await bcrypt.compare(body.data.mot_de_passe_actuel, admin.mot_de_passe))) {
+            return error(c, 'Mot de passe actuel incorrect', 401);
+        }
+    }
+    const data = {};
+    if (body.data.email)
+        data.email = body.data.email.trim().toLowerCase();
+    if (body.data.nom_complet)
+        data.nom_complet = body.data.nom_complet.trim();
+    if (body.data.mot_de_passe)
+        data.mot_de_passe = await bcrypt.hash(body.data.mot_de_passe, 10);
+    try {
+        const updated = await prisma.administrateur.update({
+            where: { id_admin: id },
+            data,
+            select: { id_admin: true, email: true, nom_complet: true, est_actif: true }
+        });
+        return c.json({ success: true, message: 'Profil mis à jour', admin: updated });
+    }
+    catch (e) {
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+            return error(c, 'Cet email est déjà utilisé par un autre administrateur', 409);
+        }
+        console.error('Mise à jour profil admin', e);
+        return error(c, 'Échec de la mise à jour du profil');
+    }
+});
 // ---------------------------------------------------------------------------
 // NOMENCLATURE DES FICHIERS (le seul endroit à modifier pour changer le nom)
-// Exemple : NOTES_2026-2027_6EME-M-1_MATHEMATIQUES_T1-CC_VALIDE.xlsx
+// Exemple : NOTES_2026-2027_6EME-M-1_MATHEMATIQUES_T1_VALIDE.xlsx
 // ---------------------------------------------------------------------------
 const slug = (v) => v
     .normalize('NFD')
@@ -976,7 +1021,10 @@ const slug = (v) => v
     .replace(/[^A-Za-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .toUpperCase();
-const buildFileName = (p) => `NOTES_${slug(p.annee)}_${slug(p.classe)}_${slug(p.matiere)}_T${p.trimestre}-${p.partie === 'cc' ? 'CC' : 'EVA'}_${p.verrouille ? 'VALIDE' : 'BROUILLON'}.xlsx`;
+const buildFileName = (p) => {
+    const suffixe = p.partie === 'cc' ? '-CC' : p.partie === 'eva' ? '-EVA' : '';
+    return `NOTES_${slug(p.annee)}_${slug(p.classe)}_${slug(p.matiere)}_T${p.trimestre}${suffixe}_${p.verrouille ? 'VALIDE' : 'BROUILLON'}.xlsx`;
+};
 // ---------------------------------------------------------------------------
 // Dashboard : tous les fichiers de notes enregistrés (brouillon) ou verrouillés
 // ---------------------------------------------------------------------------
@@ -1060,8 +1108,208 @@ app.get('/dashboard/liste', async (c) => {
         x.sequence - y.sequence);
     return c.json({ annee: year.libelle_annee, rows });
 });
+async function buildWorkbookNotes(params) {
+    const { affectation: a, trimestre: t, annee: year } = params;
+    const { cc, eva } = rolesTrimestre(t);
+    const seqIds = [cc?.id_sequence, eva?.id_sequence].filter(Boolean);
+    const [students, grades, locks] = await Promise.all([
+        prisma.affectationEleve.findMany({
+            where: { id_classe: a.id_classe, id_annee: year.id_annee },
+            include: { eleve: true },
+            orderBy: { eleve: { nom_complet: 'asc' } }
+        }),
+        prisma.note.findMany({
+            where: {
+                id_affectation_cours: a.id_affectation_cours,
+                id_sequence: { in: seqIds }
+            }
+        }),
+        prisma.verrouillageNote.findMany({
+            where: {
+                id_affectation_cours: a.id_affectation_cours,
+                id_sequence: { in: seqIds }
+            }
+        })
+    ]);
+    const notesCC = new Map();
+    const notesEva = new Map();
+    for (const n of grades) {
+        if (cc && n.id_sequence === cc.id_sequence) {
+            notesCC.set(n.id_eleve, num(n.valeur_note));
+        }
+        else if (eva && n.id_sequence === eva.id_sequence) {
+            notesEva.set(n.id_eleve, num(n.valeur_note));
+        }
+    }
+    const lockCC = cc ? locks.find(l => l.id_sequence === cc.id_sequence && l.est_verrouille) : null;
+    const lockEva = eva ? locks.find(l => l.id_sequence === eva.id_sequence && l.est_verrouille) : null;
+    const estVerrouilleCC = Boolean(lockCC);
+    const estVerrouilleEva = Boolean(lockEva);
+    const toutVerrouille = Boolean(cc && eva && estVerrouilleCC && estVerrouilleEva);
+    let statutTexte = 'Brouillon (non validé)';
+    if (toutVerrouille) {
+        const dates = [lockCC?.date_verrouillage, lockEva?.date_verrouillage].filter(Boolean);
+        const dateMax = dates.length ? new Date(Math.max(...dates.map(d => d.getTime()))) : null;
+        statutTexte = `Validé et verrouillé${dateMax ? ` le ${dateMax.toLocaleDateString('fr-FR')}` : ''}`;
+    }
+    else if (estVerrouilleCC && !estVerrouilleEva) {
+        statutTexte = '1re éval. (30 %) validée, Éval. harmonisée (70 %) en brouillon';
+    }
+    else if (!estVerrouilleCC && estVerrouilleEva) {
+        statutTexte = '1re éval. (30 %) en brouillon, Éval. harmonisée (70 %) validée';
+    }
+    const coefficient = num(a.coefficient);
+    const NAVY = 'FF0B1F4B';
+    const GOLD = 'FFC9A227';
+    const thin = { style: 'thin', color: { argb: 'FFB8C2D6' } };
+    const border = { top: thin, left: thin, bottom: thin, right: thin };
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'Collège Catholique Saint Charles Borromée';
+    wb.created = new Date();
+    const ws = wb.addWorksheet(`Notes T${t.numero_trimestre}`);
+    ws.columns = [
+        { width: 8 }, // A: N°
+        { width: 44 }, // B: Nom et prénom(s) de l'élève
+        { width: 20 }, // C: 1re Évaluation (30 %)
+        { width: 24 }, // D: Évaluation harmonisée (70 %)
+        { width: 24 }, // E: Note finale / Moyenne (100 %)
+        { width: 20 } // F: Note × Coef
+    ];
+    ws.pageSetup = { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
+    // En-tête de l'établissement
+    ws.mergeCells('A1:F1');
+    ws.getCell('A1').value = 'COLLÈGE CATHOLIQUE SAINT CHARLES BORROMÉE';
+    ws.getCell('A1').font = { bold: true, size: 14, color: { argb: NAVY } };
+    ws.getCell('A1').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(1).height = 28;
+    ws.mergeCells('A2:F2');
+    ws.getCell('A2').value = `Relevé des notes — Trimestre ${t.numero_trimestre}`;
+    ws.getCell('A2').font = { bold: true, size: 11, color: { argb: GOLD } };
+    ws.getCell('A2').alignment = { horizontal: 'center', vertical: 'middle' };
+    ws.getRow(2).height = 20;
+    // Métadonnées du cours
+    const info = [
+        ['Année scolaire', year.libelle_annee],
+        ['Classe', a.classe.nom_classe],
+        ['Matière', a.matiere.libelle_matiere],
+        ['Enseignant', a.enseignant.nom_complet],
+        ['Coefficient', String(coefficient)],
+        ['Statut', statutTexte]
+    ];
+    info.forEach(([label, value], i) => {
+        const r = 4 + i;
+        ws.mergeCells(`A${r}:F${r}`);
+        ws.getCell(`A${r}`).value = { richText: [{ text: `${label} : `, font: { bold: true } }, { text: value }] };
+        ws.getRow(r).height = 18;
+    });
+    // En-tête des colonnes du tableau
+    const HEADER_ROW = 11;
+    const header = ws.getRow(HEADER_ROW);
+    const libelleColCC = cc ? `${libelleCC(t.numero_trimestre)} (30 %)` : 'Éval. continue (30 %)';
+    const libelleColEva = eva ? `${libelleEva(t.numero_trimestre)} (70 %)` : 'Éva harmonisée (70 %)';
+    header.values = [
+        'N°',
+        'Nom et prénom(s) de l’élève',
+        libelleColCC,
+        libelleColEva,
+        'Moyenne trimestrielle (100 %)',
+        `Note × Coef (${coefficient})`
+    ];
+    header.height = 26;
+    header.eachCell(cell => {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        cell.border = border;
+    });
+    ws.views = [{ state: 'frozen', ySplit: HEADER_ROW }];
+    let countCC = 0;
+    let countEva = 0;
+    let countMoyennes = 0;
+    let sumMoyennes = 0;
+    students.forEach(({ eleve }, i) => {
+        const nCC = notesCC.get(eleve.id_eleve) ?? null;
+        const nEva = notesEva.get(eleve.id_eleve) ?? null;
+        if (nCC !== null)
+            countCC++;
+        if (nEva !== null)
+            countEva++;
+        let moyTrim = null;
+        let moyNxC = null;
+        if (nCC !== null && nEva !== null) {
+            const calc = calculerTrimestre(decimal(nCC), decimal(nEva), a.coefficient);
+            if (calc) {
+                moyTrim = num(calc.moyenne);
+                moyNxC = num(calc.moyenneXCoef);
+                sumMoyennes += moyTrim;
+                countMoyennes++;
+            }
+        }
+        const rowNum = HEADER_ROW + 1 + i;
+        const row = ws.addRow([
+            i + 1,
+            eleve.nom_complet,
+            nCC,
+            nEva,
+            moyTrim,
+            moyNxC
+        ]);
+        row.height = 20;
+        row.getCell(1).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(2).alignment = { horizontal: 'left', vertical: 'middle' };
+        row.getCell(3).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(4).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(5).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(6).alignment = { horizontal: 'center', vertical: 'middle' };
+        row.getCell(3).numFmt = '0.00';
+        row.getCell(4).numFmt = '0.00';
+        row.getCell(5).numFmt = '0.00';
+        row.getCell(6).numFmt = '0.00';
+        row.getCell(5).font = { bold: true, color: { argb: 'FF1E293B' } };
+        row.getCell(6).font = { bold: true, color: { argb: 'FF1E293B' } };
+        // Si les deux notes sont présentes, associer les formules dynamiques avec résultat calculé
+        if (nCC !== null && nEva !== null) {
+            row.getCell(5).value = {
+                formula: `ROUND(C${rowNum}*0.3 + D${rowNum}*0.7, 2)`,
+                result: moyTrim
+            };
+            row.getCell(6).value = {
+                formula: `ROUND(E${rowNum}*${coefficient}, 2)`,
+                result: moyNxC
+            };
+        }
+        row.eachCell({ includeEmpty: true }, cell => { cell.border = border; });
+    });
+    // Statistiques et pied de page
+    ws.addRow([]);
+    const moyenneClasse = countMoyennes > 0 ? (sumMoyennes / countMoyennes).toFixed(2) : '—';
+    [
+        `Effectif total : ${students.length} élève(s)`,
+        `Notes saisies — ${libelleColCC} : ${countCC} / ${students.length}`,
+        `Notes saisies — ${libelleColEva} : ${countEva} / ${students.length}`,
+        `Moyennes trimestrielles calculées : ${countMoyennes} / ${students.length}`,
+        `Moyenne générale de la classe : ${moyenneClasse} / 20 (avant coefficient)`,
+        `Exporté le ${new Date().toLocaleString('fr-FR')}`
+    ].forEach(text => {
+        const r = ws.addRow([text]);
+        ws.mergeCells(`A${r.number}:F${r.number}`);
+        r.font = { bold: true, size: 9, color: { argb: 'FF334155' } };
+        r.height = 18;
+    });
+    const fileName = buildFileName({
+        annee: year.libelle_annee,
+        classe: a.classe.nom_classe,
+        matiere: a.matiere.libelle_matiere,
+        trimestre: t.numero_trimestre,
+        partie: 'trimestre',
+        verrouille: toutVerrouille
+    });
+    const buffer = await wb.xlsx.writeBuffer();
+    return { buffer, fileName };
+}
 // ---------------------------------------------------------------------------
-// Export Excel d'un fichier de notes (un cours + une séquence)
+// Export Excel d'un fichier de notes trimestrielles (Dashboard)
+// Endpoint existant appelé par le Frontend : id_affectation_cours & id_sequence
 // ---------------------------------------------------------------------------
 app.get('/dashboard/export', async (c) => {
     const q = adminTargetSchema.safeParse(c.req.query());
@@ -1079,107 +1327,7 @@ app.get('/dashboard/export', async (c) => {
     ]);
     if (!a || !s)
         return error(c, 'Cours ou séquence introuvable', 404);
-    const [students, grades, lock] = await Promise.all([
-        prisma.affectationEleve.findMany({
-            where: { id_classe: a.id_classe, id_annee: year.id_annee },
-            include: { eleve: true },
-            orderBy: { eleve: { nom_complet: 'asc' } }
-        }),
-        prisma.note.findMany({ where: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } }),
-        prisma.verrouillageNote.findUnique({
-            where: { id_affectation_cours_id_sequence: { id_affectation_cours: a.id_affectation_cours, id_sequence: s.id_sequence } }
-        })
-    ]);
-    const verrouille = lock?.est_verrouille ?? false;
-    const byId = new Map(grades.map(n => [n.id_eleve, n]));
-    const coefficient = num(a.coefficient);
-    const NAVY = 'FF0B1F4B';
-    const GOLD = 'FFC9A227';
-    const thin = { style: 'thin', color: { argb: 'FFB8C2D6' } };
-    const border = { top: thin, left: thin, bottom: thin, right: thin };
-    const wb = new ExcelJS.Workbook();
-    wb.creator = 'Collège Catholique Saint Charles Borromée';
-    wb.created = new Date();
-    const ws = wb.addWorksheet('Notes');
-    ws.columns = [{ width: 8 }, { width: 46 }, { width: 14 }, { width: 20 }];
-    ws.pageSetup = { orientation: 'portrait', fitToPage: true, fitToWidth: 1, fitToHeight: 0 };
-    ws.mergeCells('A1:D1');
-    ws.getCell('A1').value = 'COLLÈGE CATHOLIQUE SAINT CHARLES BORROMÉE';
-    ws.getCell('A1').font = { bold: true, size: 14, color: { argb: NAVY } };
-    ws.getCell('A1').alignment = { horizontal: 'center' };
-    ws.mergeCells('A2:D2');
-    const partie = s.trimestre.sequences
-        .slice()
-        .sort((x, y) => x.numero_sequence - y.numero_sequence)
-        .findIndex(x => x.id_sequence === s.id_sequence) === 0 ? 'cc' : 'eva';
-    const libellePartie = partie === 'cc' ? `CC${s.trimestre.numero_trimestre} (30 %)` : `Éva de niveau ${s.trimestre.numero_trimestre} (70 %)`;
-    ws.getCell('A2').value = `Relevé de notes, ${libellePartie}`;
-    ws.getCell('A2').font = { bold: true, size: 11, color: { argb: GOLD } };
-    ws.getCell('A2').alignment = { horizontal: 'center' };
-    const dateVerrou = lock?.date_verrouillage ? lock.date_verrouillage.toLocaleDateString('fr-FR') : null;
-    const info = [
-        ['Année scolaire', year.libelle_annee],
-        ['Classe', a.classe.nom_classe],
-        ['Matière', a.matiere.libelle_matiere],
-        ['Enseignant', a.enseignant.nom_complet],
-        ['Coefficient', String(coefficient)],
-        ['Statut', verrouille ? `Validé et verrouillé${dateVerrou ? ` le ${dateVerrou}` : ''}` : 'Brouillon (non validé)']
-    ];
-    info.forEach(([label, value], i) => {
-        const r = 4 + i;
-        ws.mergeCells(`A${r}:D${r}`);
-        ws.getCell(`A${r}`).value = { richText: [{ text: `${label} : `, font: { bold: true } }, { text: value }] };
-    });
-    const HEADER_ROW = 11;
-    const header = ws.getRow(HEADER_ROW);
-    header.values = ['N°', 'Nom et prénom(s) de l’élève', 'Note / 20', 'Contribution au trimestre'];
-    header.height = 22;
-    header.eachCell(cell => {
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NAVY } };
-        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-        cell.border = border;
-    });
-    ws.views = [{ state: 'frozen', ySplit: HEADER_ROW }];
-    let sum = 0;
-    let count = 0;
-    students.forEach(({ eleve }, i) => {
-        const n = byId.get(eleve.id_eleve);
-        const note = n ? num(n.valeur_note) : null;
-        const poids = partie === 'cc' ? 0.30 : 0.70;
-        const contribution = note === null ? null : Number((note * poids).toFixed(2));
-        if (contribution !== null) {
-            sum += contribution;
-            count += 1;
-        }
-        const row = ws.addRow([i + 1, eleve.nom_complet, note, contribution]);
-        row.getCell(1).alignment = { horizontal: 'center' };
-        row.getCell(3).alignment = { horizontal: 'center' };
-        row.getCell(4).alignment = { horizontal: 'center' };
-        row.getCell(3).numFmt = '0.00';
-        row.getCell(4).numFmt = '0.00';
-        row.eachCell({ includeEmpty: true }, cell => { cell.border = border; });
-    });
-    ws.addRow([]);
-    [
-        `Effectif : ${students.length}`,
-        `Notes saisies : ${count} / ${students.length}`,
-        `Contribution moyenne de la classe : ${count ? (sum / count).toFixed(2) : '—'} / 20 (avant coefficient)`,
-        `Exporté le ${new Date().toLocaleString('fr-FR')}`
-    ].forEach(text => {
-        const r = ws.addRow([text]);
-        ws.mergeCells(`A${r.number}:D${r.number}`);
-        r.font = { bold: true };
-    });
-    const fileName = buildFileName({
-        annee: year.libelle_annee,
-        classe: a.classe.nom_classe,
-        matiere: a.matiere.libelle_matiere,
-        trimestre: s.trimestre.numero_trimestre,
-        partie,
-        verrouille
-    });
-    const buffer = await wb.xlsx.writeBuffer();
+    const { buffer, fileName } = await buildWorkbookNotes({ affectation: a, trimestre: s.trimestre, annee: year });
     return c.body(new Uint8Array(buffer), 200, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         'Content-Disposition': `attachment; filename="${fileName}"`
