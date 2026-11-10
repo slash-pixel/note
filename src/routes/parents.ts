@@ -17,7 +17,7 @@ parentsApp.get('/parents/status', (c) => {
 
 /**
  * Route : GET /parents/notes
- * Paramètres attendus : ?matricule=... ou ?q=... ou ?nom=...
+ * Paramètre attendu : ?matricule=...
  * Exemple : /api/parents/notes?matricule=250143811
  */
 parentsApp.get('/parents/notes', (c) => {
@@ -28,29 +28,21 @@ parentsApp.get('/parents/notes', (c) => {
     }, 503);
   }
 
-  const matricule = c.req.query('matricule');
-  const nom = c.req.query('nom');
-  const q = c.req.query('q');
+  const matricule = c.req.query('matricule')?.trim();
 
-  const query = (matricule || q || nom || '').trim();
-
-  if (!query) {
+  if (!matricule) {
     return c.json({
       success: false,
-      message: 'Veuillez fournir un matricule ou un nom (ex: /api/parents/notes?matricule=250143811)',
+      message: 'Le paramètre matricule est requis (ex: /api/parents/notes?matricule=250143811)',
     }, 400);
   }
 
-  const result = notesStore.search({
-    matricule: matricule || q,
-    nom: nom || (!matricule ? q : undefined),
-    q,
-  });
+  const result = notesStore.search({ matricule });
 
   if (!result) {
     return c.json({
       success: false,
-      message: `Aucun élève trouvé pour la recherche "${query}"`,
+      message: `Aucun élève trouvé pour le matricule "${matricule}"`,
     }, 404);
   }
 

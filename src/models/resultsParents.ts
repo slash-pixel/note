@@ -7,6 +7,11 @@ export interface NoteRow {
   matiere: string;
   trimestre: string;
   coefficient: number;
+  interro1: number;
+  interro2: number;
+  interro3: number;
+  interro4: number;
+  interro5: number;
   moyenneInterro: number;
   devoir1: number;
   devoir2: number;
@@ -29,9 +34,7 @@ export interface StudentResult {
 }
 
 export interface SearchCriteria {
-  matricule?: string;
-  nom?: string;
-  q?: string;
+  matricule: string;
 }
 
 export interface StoreStatus {

@@ -42,7 +42,7 @@ const loginBody = jsonBody({
   required: ['id', 'mot_de_passe'],
 });
 
-app.get('/doc', c => c.json({
+app.get('/doc', (c) => c.json({
   openapi: '3.1.0',
   info: {
     title: 'API Gestion Scolaire — Notes, NxC, Verrouillages et Espace Parents',
@@ -61,15 +61,20 @@ app.get('/doc', c => c.json({
       ParentNoteItem: {
         type: 'object',
         properties: {
-          matiere: { type: 'string', example: 'MATHEMATIQUES (Ecrite)' },
+          matiere: { type: 'string', example: 'ST (Ecrite)' },
           trimestre: { type: 'string', example: '1er trimestre' },
           coefficient: { type: 'number', example: 4 },
-          moyenneInterro: { type: 'number', example: 13.5 },
-          devoir1: { type: 'number', example: 14 },
-          devoir2: { type: 'number', example: 12 },
-          composition: { type: 'number', example: 15 },
-          moyenneGenerale: { type: 'number', example: 14.2 },
-          moyenneCoef: { type: 'number', example: 56.8 },
+          interro1: { type: 'number', example: 13 },
+          interro2: { type: 'number', example: 13 },
+          interro3: { type: 'number', example: 0 },
+          interro4: { type: 'number', example: 0 },
+          interro5: { type: 'number', example: 13 },
+          moyenneInterro: { type: 'number', example: 13 },
+          devoir1: { type: 'number', example: 0 },
+          devoir2: { type: 'number', example: 0 },
+          composition: { type: 'number', example: 0 },
+          moyenneGenerale: { type: 'number', example: 0 },
+          moyenneCoef: { type: 'number', example: 0 },
           rang: { type: 'string', example: '2e' },
           mention: { type: 'string', example: 'Bien' },
           familleMatiere: { type: 'string', example: 'Matières scientifiques' },
@@ -79,9 +84,9 @@ app.get('/doc', c => c.json({
       ParentStudentResult: {
         type: 'object',
         properties: {
-          codeeleve: { type: 'string', example: '565' },
-          matricule: { type: 'string', example: '250143811' },
-          nomEleve: { type: 'string', example: 'ENENGUE  ISMAËL' },
+          codeeleve: { type: 'string', example: '59' },
+          matricule: { type: 'string', example: '480' },
+          nomEleve: { type: 'string', example: 'ABOUGOU France FORTUNE' },
           anneeScolaire: { type: 'string', example: '2026 - 2027' },
           totalNotes: { type: 'number', example: 40 },
           notes: {
@@ -104,29 +109,15 @@ app.get('/doc', c => c.json({
     '/api/parents/notes': {
       get: {
         tags: ['Parents'],
-        summary: 'Consulter les notes d’un élève (par matricule ou nom)',
-        description: 'Permet à un parent de saisir le matricule de son enfant (ou son code élève) extrait du fichier Excel de notes afin de voir l’intégralité de ses résultats scolaires (matières, coefficients, interrogations, devoirs, compositions, moyennes et rangs).',
+        summary: 'Consulter les notes d’un élève par matricule',
+        description: 'Permet à un parent de saisir le matricule de son enfant afin de voir l’intégralité de ses résultats scolaires (matières, coefficients, interrogations 1 à 5, moyenne des interrogations, devoirs, compositions, moyennes et rangs).',
         parameters: [
           {
             name: 'matricule',
             in: 'query',
-            required: false,
-            description: 'Matricule officiel de l’élève ou code élève (ex: 250143811 ou 480)',
-            schema: { type: 'string', example: '250143811' },
-          },
-          {
-            name: 'nom',
-            in: 'query',
-            required: false,
-            description: 'Nom de l’élève pour recherche partielle (ex: ENENGUE)',
-            schema: { type: 'string', example: 'ENENGUE' },
-          },
-          {
-            name: 'q',
-            in: 'query',
-            required: false,
-            description: 'Terme de recherche global (matricule ou nom)',
-            schema: { type: 'string', example: '250143811' },
+            required: true,
+            description: 'Matricule officiel de l’élève (ex: 480 ou 250143811)',
+            schema: { type: 'string', example: '480' },
           },
         ],
         responses: {
@@ -144,8 +135,8 @@ app.get('/doc', c => c.json({
               },
             },
           },
-          '400': response('Paramètre matricule ou nom manquant'),
-          '404': response('Aucun élève trouvé pour ce matricule/nom'),
+          '400': response('Paramètre matricule manquant'),
+          '404': response('Aucun élève trouvé pour ce matricule'),
           '503': response('Fichier Excel en cours d’initialisation en mémoire'),
         },
       },
@@ -154,14 +145,14 @@ app.get('/doc', c => c.json({
       get: {
         tags: ['Parents'],
         summary: 'Consulter directement les notes via l’URL (par matricule)',
-        description: 'Accès direct et immédiat aux résultats de l’enfant en spécifiant son matricule directement dans le chemin de l’URL (ex: /api/parents/notes/250143811).',
+        description: 'Accès direct et immédiat aux résultats de l’enfant en spécifiant son matricule directement dans le chemin de l’URL (ex: /api/parents/notes/480).',
         parameters: [
           {
             name: 'matricule',
             in: 'path',
             required: true,
-            description: 'Matricule officiel de l’élève ou code élève (ex: 250143811 ou 480)',
-            schema: { type: 'string', example: '250143811' },
+            description: 'Matricule officiel de l’élève (ex: 480 ou 250143811)',
+            schema: { type: 'string', example: '480' },
           },
         ],
         responses: {

@@ -10,7 +10,7 @@ import parentsApp from './routes/parents.js';
 import { notesStore } from './services/excelsParentsServices.js';
 const app = new Hono();
 // CORS : avec credentials=true, autoriser explicitement les origines du frontend (incluant Netlify et le développement local).
-const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? 'http://localhost:5173,http://localhost:3000,https://gesnotes.netlify.app')
+const allowedOrigins = (process.env.FRONTEND_ORIGINS ?? 'http://localhost:5173,http://localhost:3000,https://gesnotes.netlify.app,https://stcharlesborromee.org')
     .split(',').map(value => value.trim()).filter(Boolean);
 app.use('/api/*', cors({
     origin: origin => allowedOrigins.includes(origin) ? origin : '',

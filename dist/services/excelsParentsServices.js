@@ -17,7 +17,12 @@ function mergeNotes(existing, incoming) {
         ? existing.coefficient
         : (incoming.coefficient > 0 ? incoming.coefficient : 0);
     // Meilleurs scores d'évaluations individuelles
-    const bestInterro = Math.max(existing.moyenneInterro || 0, incoming.moyenneInterro || 0);
+    const bestInterro1 = Math.max(existing.interro1 || 0, incoming.interro1 || 0);
+    const bestInterro2 = Math.max(existing.interro2 || 0, incoming.interro2 || 0);
+    const bestInterro3 = Math.max(existing.interro3 || 0, incoming.interro3 || 0);
+    const bestInterro4 = Math.max(existing.interro4 || 0, incoming.interro4 || 0);
+    const bestInterro5 = Math.max(existing.interro5 || 0, incoming.interro5 || 0);
+    const bestMoyenneInterro = Math.max(existing.moyenneInterro || 0, incoming.moyenneInterro || 0);
     const bestDev1 = Math.max(existing.devoir1 || 0, incoming.devoir1 || 0);
     const bestDev2 = Math.max(existing.devoir2 || 0, incoming.devoir2 || 0);
     const bestComp = Math.max(existing.composition || 0, incoming.composition || 0);
@@ -33,7 +38,12 @@ function mergeNotes(existing, incoming) {
         matiere: existing.matiere || incoming.matiere,
         trimestre: existing.trimestre || incoming.trimestre,
         coefficient: bestCoef,
-        moyenneInterro: bestInterro,
+        interro1: bestInterro1,
+        interro2: bestInterro2,
+        interro3: bestInterro3,
+        interro4: bestInterro4,
+        interro5: bestInterro5,
+        moyenneInterro: bestMoyenneInterro,
         devoir1: bestDev1,
         devoir2: bestDev2,
         composition: bestComp,
@@ -46,7 +56,7 @@ function mergeNotes(existing, incoming) {
     };
 }
 class StudentNotesStore {
-    // Indexation principale par clé normalisée (minuscules, sans espaces superflus)
+    // Indexation par matricule et code élève
     byMatricule = new Map();
     byCode = new Map();
     studentsList = [];
@@ -57,8 +67,7 @@ class StudentNotesStore {
     _error = null;
     _totalNotes = 0;
     /**
-     * Charge le fichier Excel en mémoire et indexe les notes par élève (matricule, code, nom).
-     * Dédoublonne les matières par trimestre et retient la note la plus élevée/complète.
+     * Charge le fichier Excel en mémoire et indexe les notes par élève.
      */
     async loadExcel(filePath = 'Notes_au_06_11_2026.xlsx') {
         const resolvedPath = path.isAbsolute(filePath)
@@ -106,6 +115,12 @@ class StudentNotesStore {
             const idxFamilleMatiere = getColIndex('familledematiere', 'famille_matiere');
             const idxTrimestre = getColIndex('nom_trimsem', 'trimestre', 'trimestre_semestre');
             const idxCoefficient = getColIndex('coefficient', 'coef');
+            // Mappage des interrogations 1 à 5 et de la moyenne
+            const idxInterro1 = getColIndex('interrogation 1', 'interrogation1', 'interro1', 'interro 1');
+            const idxInterro2 = getColIndex('interrogation 2', 'interrogation2', 'interro2', 'interro 2');
+            const idxInterro3 = getColIndex('interrogation 3', 'interrogation3', 'interro3', 'interro 3');
+            const idxInterro4 = getColIndex('interrogation 4', 'interrogation4', 'interro4', 'interro 4');
+            const idxInterro5 = getColIndex('interrogation 5', 'interrogation5', 'interro5', 'interro 5');
             const idxMoyenneInterro = getColIndex('moyenneinterrogation', 'moyenne_interro', 'interrogations');
             const idxDevoir1 = getColIndex('devoir1', 'dev1');
             const idxDevoir2 = getColIndex('devoir2', 'dev2');
@@ -159,15 +174,12 @@ class StudentNotesStore {
                 const matricule = extractString(row, idxMatricule);
                 const nomEleve = extractString(row, idxNomEleve);
                 const anneeScolaire = extractString(row, idxAnneeScolaire);
-                // Si la ligne ne contient ni matricule ni code élève, on l'ignore
                 if (!matricule && !codeeleve)
                     return;
-                // Clés normalisées pour recherche insensible à la casse
                 const normCode = codeeleve.toLowerCase();
                 const normMat = matricule.toLowerCase();
-                // Réconciliation de l'élève : relier par code OU par matricule
-                let student = (normCode ? tempByCode.get(normCode) : undefined) ||
-                    (normMat ? tempByMatricule.get(normMat) : undefined);
+                let student = (normMat ? tempByMatricule.get(normMat) : undefined) ||
+                    (normCode ? tempByCode.get(normCode) : undefined);
                 if (!student) {
                     student = {
                         codeeleve,
@@ -183,7 +195,6 @@ class StudentNotesStore {
                         tempByMatricule.set(normMat, student);
                 }
                 else {
-                    // Si l'élève existait déjà mais sans matricule (ou sans code), on complète ses informations
                     if (!student.matricule && matricule) {
                         student.matricule = matricule;
                         if (normMat)
@@ -203,13 +214,16 @@ class StudentNotesStore {
                 }
                 const matiere = extractString(row, idxNomMatiere);
                 const trimestre = extractString(row, idxTrimestre);
-                // Clé unique pour dédoublonner : matière + trimestre
                 const subjectKey = `${matiere.toLowerCase()}___${trimestre.toLowerCase()}`;
-                // Construction de la note entrante
                 const noteItem = {
                     matiere,
                     trimestre,
                     coefficient: extractNumber(row, idxCoefficient),
+                    interro1: extractNumber(row, idxInterro1),
+                    interro2: extractNumber(row, idxInterro2),
+                    interro3: extractNumber(row, idxInterro3),
+                    interro4: extractNumber(row, idxInterro4),
+                    interro5: extractNumber(row, idxInterro5),
                     moyenneInterro: extractNumber(row, idxMoyenneInterro),
                     devoir1: extractNumber(row, idxDevoir1),
                     devoir2: extractNumber(row, idxDevoir2),
@@ -225,19 +239,15 @@ class StudentNotesStore {
                     student.notesMap.set(subjectKey, noteItem);
                 }
                 else {
-                    // Doublon sur la même matière et trimestre :
-                    // On fusionne et on conserve la meilleure note (remplace notamment les moyennes < 5 par la vraie note plus grande)
                     const existingNote = student.notesMap.get(subjectKey);
                     const merged = mergeNotes(existingNote, noteItem);
                     student.notesMap.set(subjectKey, merged);
                 }
             });
-            // Calcul du total des notes dédoublonnées
             let totalNotesCount = 0;
             for (const s of tempStudentsList) {
                 totalNotesCount += s.notesMap.size;
             }
-            // Remplacement atomique des Maps en mémoire
             this.byMatricule = tempByMatricule;
             this.byCode = tempByCode;
             this.studentsList = tempStudentsList;
@@ -247,8 +257,7 @@ class StudentNotesStore {
             this._isLoaded = true;
             const duration = Date.now() - startTime;
             console.log(`[ExcelStore] ✅ Fichier chargé et dédoublonné avec succès en ${duration}ms : ` +
-                `${this.studentsList.length} élèves indexés (${this.byMatricule.size} par matricule, ${this.byCode.size} par code), ` +
-                `${totalNotesCount} notes dédoublonnées (vraies notes conservées).`);
+                `${this.studentsList.length} élèves indexés, ${totalNotesCount} notes dédoublonnées.`);
         }
         catch (err) {
             this._error = err?.message || 'Erreur inconnue lors du chargement Excel';
@@ -260,39 +269,18 @@ class StudentNotesStore {
         }
     }
     /**
-     * Recherche un élève par matricule, code élève ou nom.
-     * Retourne l'ensemble de ses notes nettoyées, dédoublonnées et avec les vraies moyennes.
+     * Recherche un élève exclusivement par son matricule.
      */
     search(queryOrCriteria) {
         if (!this._isLoaded || !queryOrCriteria)
             return null;
-        let targetMatricule;
-        let targetNom;
-        if (typeof queryOrCriteria === 'string') {
-            const q = queryOrCriteria.trim();
-            targetMatricule = q;
-            targetNom = q;
-        }
-        else {
-            targetMatricule = (queryOrCriteria.matricule || queryOrCriteria.q)?.trim();
-            targetNom = (queryOrCriteria.nom || queryOrCriteria.q)?.trim();
-        }
-        let found;
-        // 1. Recherche prioritaire par matricule exact ou code élève
-        if (targetMatricule) {
-            const normMat = targetMatricule.toLowerCase();
-            found = this.byMatricule.get(normMat) || this.byCode.get(normMat);
-        }
-        // 2. Recherche par nom si aucun matricule n'a correspondu
-        if (!found && targetNom) {
-            const searchName = targetNom.toLowerCase();
-            // Correspondance exacte d'abord
-            found = this.studentsList.find(s => s.nomEleve.toLowerCase() === searchName);
-            // Sinon correspondance partielle
-            if (!found) {
-                found = this.studentsList.find(s => s.nomEleve.toLowerCase().includes(searchName));
-            }
-        }
+        const targetMatricule = typeof queryOrCriteria === 'string'
+            ? queryOrCriteria.trim()
+            : (queryOrCriteria.matricule || '').trim();
+        if (!targetMatricule)
+            return null;
+        const normMat = targetMatricule.toLowerCase();
+        const found = this.byMatricule.get(normMat) || this.byCode.get(normMat);
         if (!found)
             return null;
         const notesList = Array.from(found.notesMap.values());
@@ -305,15 +293,9 @@ class StudentNotesStore {
             notes: notesList,
         };
     }
-    /**
-     * Vérifie si le fichier est chargé en mémoire.
-     */
     isLoaded() {
         return this._isLoaded;
     }
-    /**
-     * Retourne l'état courant du store.
-     */
     getStatus() {
         return {
             isLoaded: this._isLoaded,
