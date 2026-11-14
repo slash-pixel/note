@@ -211,7 +211,7 @@ app.get('/reference', apiReference({
     theme: 'purple',
 }));
 // Chargement du fichier Excel de notes en mémoire au démarrage du serveur
-const excelFilePath = process.env.EXCEL_NOTES_PATH || 'Notes_au_06_11_2026.xlsx';
+const excelFilePath = process.env.EXCEL_NOTES_PATH || 'NOTES_AU_14_11_2026.xlsx';
 try {
     await notesStore.loadExcel(excelFilePath);
 }

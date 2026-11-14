@@ -97,7 +97,7 @@ class StudentNotesStore {
   /**
    * Charge le fichier Excel en mémoire et indexe les notes par élève.
    */
-  async loadExcel(filePath: string = 'Notes_au_06_11_2026.xlsx'): Promise<void> {
+  async loadExcel(filePath: string = 'NOTES_AU_14_11_2026.xlsx'): Promise<void> {
     const resolvedPath = path.isAbsolute(filePath)
       ? filePath
       : path.resolve(process.cwd(), filePath);
