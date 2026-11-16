@@ -154,6 +154,7 @@ app.use('/notes/*', async (c, next) => {
   if (!/^Bearer \S+$/.test(header)) return error(c, 'Token manquant', 401);
   try {
     const p = await verify(header.slice(7), secret!, 'HS256');
+console.log('[AUTH NOTES] Rôle JWT :', p.role);
     if ((p.role !== 'admin' && p.role !== 'enseignant') || typeof p.sub !== 'string' || !uuid.safeParse(p.sub).success) return error(c, 'Token invalide', 401);
     const person = p.role === 'admin'
       ? await prisma.administrateur.findUnique({ where: { id_admin: p.sub }, select: { est_actif: true } })
@@ -518,6 +519,8 @@ await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${a.id_affectation_co
 
 // Admin: reopen a finalized course/sequence, then the teacher can edit and finalize again.
 app.post('/notes/admin/deverrouiller', async c => {
+  console.log('[DEVERROUILLAGE] Rôle actor :', c.get('actor')?.role);
+
   if (c.get('actor').role !== 'admin') return error(c, 'Réservé à l’administration', 403);
   const parsed = adminTargetSchema.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return error(c, 'Données invalides');
