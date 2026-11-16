@@ -10,7 +10,9 @@ const prisma = new PrismaClient();
 const app = new Hono<{ Variables: { actor: { id: string; role: 'enseignant' | 'admin' } } }>();
 const secret = process.env.JWT_SECRET;
 if (!secret || secret.length < 32) throw new Error('JWT_SECRET doit contenir au moins 32 caractères');
-const uuid = z.string().uuid();
+const uuid = z.string().regex(
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
+);
 const enseignantLoginSchema = z.object({ id_enseignant: uuid, mot_de_passe: z.string().min(1) });
 const adminLoginSchema = z.object({ email: z.string().email(), mot_de_passe: z.string().min(1) });
 const targetSchema = z.object({ id_classe: uuid, id_matiere: uuid, id_sequence: uuid });
