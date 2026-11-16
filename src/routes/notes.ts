@@ -1,7 +1,6 @@
 import { Hono } from 'hono';
 import { Prisma, PrismaClient } from '@prisma/client';
 import ExcelJS from 'exceljs';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { sign, verify } from 'hono/jwt';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
@@ -12,7 +11,8 @@ const app = new Hono<{ Variables: { actor: { id: string; role: 'enseignant' | 'a
 const secret = process.env.JWT_SECRET;
 if (!secret || secret.length < 32) throw new Error('JWT_SECRET doit contenir au moins 32 caractères');
 const uuid = z.string().uuid();
-const authSchema = z.object({ id_enseignant: uuid.optional(), id_admin: uuid.optional(), mot_de_passe: z.string().min(1) });
+const enseignantLoginSchema = z.object({ id_enseignant: uuid, mot_de_passe: z.string().min(1) });
+const adminLoginSchema = z.object({ email: z.string().email(), mot_de_passe: z.string().min(1) });
 const targetSchema = z.object({ id_classe: uuid, id_matiere: uuid, id_sequence: uuid });
 const notesSchema = targetSchema.extend({
   coefficient: z.number().finite().min(0.01).max(99.99),
@@ -35,25 +35,35 @@ const getAssignment = (id_matiere: string, id_classe: string, id_annee: string) 
   prisma.affectationCours.findUnique({ where: { id_matiere_id_classe_id_annee: { id_matiere, id_classe, id_annee } }, include: { matiere: true, classe: true } });
 const getSequence = (id_sequence: string, id_annee: string) =>
   prisma.sequence.findFirst({ where: { id_sequence, trimestre: { id_annee } }, include: { trimestre: { include: { sequences: { orderBy: { numero_sequence: 'asc' } } } } } });
-const isOwner = (actor: { id: string; role: string }, assignment: { id_enseignant: string }) =>
-  actor.role === 'admin' || actor.id === assignment.id_enseignant;
 
-async function login(c: any, role: 'enseignant' | 'admin') {
-  const body = authSchema.safeParse(await c.req.json().catch(() => null));
+// ---------------------------------------------------------------------------
+// Authentification
+// ---------------------------------------------------------------------------
+// Enseignant : toujours par id_enseignant (choisi dans une liste côté frontend) + mot de passe.
+app.post('/auth/login', async c => {
+  const body = enseignantLoginSchema.safeParse(await c.req.json().catch(() => null));
   if (!body.success) return error(c, 'Données de connexion invalides', 400);
-  const id = role === 'admin' ? body.data.id_admin : body.data.id_enseignant;
-  if (!id) return error(c, 'Identifiant manquant ou invalide', 400);
-  const person = role === 'admin'
-    ? await prisma.administrateur.findUnique({ where: { id_admin: id } })
-    : await prisma.enseignant.findUnique({ where: { id_enseignant: id } });
-  if (!person || !person.est_actif || !(await bcrypt.compare(body.data.mot_de_passe, person.mot_de_passe))) {
+  const enseignant = await prisma.enseignant.findUnique({ where: { id_enseignant: body.data.id_enseignant } });
+  if (!enseignant || !enseignant.est_actif || !(await bcrypt.compare(body.data.mot_de_passe, enseignant.mot_de_passe))) {
     return error(c, 'Identifiants incorrects ou compte inactif', 401);
   }
-  const token = await sign({ sub: id, role, exp: Math.floor(Date.now() / 1000) + 4 * 3600 }, secret!, 'HS256');
-  return c.json({ token, role, nom_complet: person.nom_complet, message: 'Connexion réussie' });
-}
-app.post('/auth/login', c => login(c, 'enseignant'));
-app.post('/admin/auth/login', c => login(c, 'admin'));
+  const token = await sign({ sub: enseignant.id_enseignant, role: 'enseignant', exp: Math.floor(Date.now() / 1000) + 4 * 3600 }, secret!, 'HS256');
+  return c.json({ token, role: 'enseignant', nom_complet: enseignant.nom_complet, message: 'Connexion réussie' });
+});
+
+// Administrateur : désormais par email + mot de passe. Ce même compte sert à la fois
+// pour le déverrouillage des notes (/notes/admin/*) et pour le dashboard (/dashboard/*).
+app.post('/admin/auth/login', async c => {
+  const body = adminLoginSchema.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return error(c, 'Données de connexion invalides', 400);
+  const email = body.data.email.trim().toLowerCase();
+  const admin = await prisma.administrateur.findUnique({ where: { email } });
+  if (!admin || !admin.est_actif || !(await bcrypt.compare(body.data.mot_de_passe, admin.mot_de_passe))) {
+    return error(c, 'Identifiants incorrects ou compte inactif', 401);
+  }
+  const token = await sign({ sub: admin.id_admin, role: 'admin', exp: Math.floor(Date.now() / 1000) + 4 * 3600 }, secret!, 'HS256');
+  return c.json({ token, role: 'admin', nom_complet: admin.nom_complet, email: admin.email, message: 'Connexion réussie' });
+});
 
 app.get('/trimestres', async c => {
   const year = await activeYear();
@@ -100,7 +110,7 @@ app.get('/enseignants', async c => {
   return c.json(enseignants);
 });
 
-// Matières explicitement autorisées pour un enseignant.
+// Matières explicitement autorisées pour un enseignant (= ce qu'il a le droit de voir/saisir).
 app.get('/enseignants/:id_enseignant/matieres', async c => {
   const id = uuid.safeParse(c.req.param('id_enseignant'));
   if (!id.success) return error(c, 'Enseignant invalide');
@@ -937,44 +947,11 @@ app.delete('/notes/admin/autorisation-matieres', async c => {
 });
 
 // ---------------------------------------------------------------------------
-// Dashboard sécurisé par mot de passe
+// Dashboard
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Accès au dashboard : un simple mot de passe partagé (DASHBOARD_PASSWORD)
-// ---------------------------------------------------------------------------
-const dashboardPassword = process.env.DASHBOARD_PASSWORD;
-const safeEqual = (a: string, b: string) =>
-  timingSafeEqual(createHash('sha256').update(a).digest(), createHash('sha256').update(b).digest());
-
-// Limite les essais : 8 erreurs par 15 minutes et par adresse IP
-const attempts = new Map<string, { count: number; resetAt: number }>();
-const clientIp = (c: any) => String(c.req.header('x-forwarded-for') || 'local').split(',')[0].trim();
-
-app.post('/dashboard/login', async c => {
-  if (!dashboardPassword || dashboardPassword.length < 8) {
-    return c.json({ error: 'Accès au tableau de bord non configuré sur le serveur' }, 503);
-  }
-  const ip = clientIp(c);
-  const now = Date.now();
-  const entry = attempts.get(ip);
-  const active = entry && entry.resetAt > now ? entry : null;
-  if (active && active.count >= 8) {
-    return c.json({ error: 'Trop de tentatives. Réessayez dans quelques minutes.' }, 429);
-  }
-
-  const body = z.object({ mot_de_passe: z.string().min(1) }).safeParse(await c.req.json().catch(() => null));
-  if (!body.success) return error(c, 'Mot de passe requis');
-
-  if (!safeEqual(body.data.mot_de_passe, dashboardPassword)) {
-    attempts.set(ip, active ? { ...active, count: active.count + 1 } : { count: 1, resetAt: now + 15 * 60 * 1000 });
-    return error(c, 'Mot de passe incorrect', 401);
-  }
-  attempts.delete(ip);
-  const token = await sign({ role: 'dashboard', exp: Math.floor(now / 1000) + 4 * 3600 }, secret!, 'HS256');
-  return c.json({ token });
-});
-
-// Toutes les autres routes /dashboard/* exigent ce jeton (enseignants exclus)
+// Accès au dashboard désormais via le MÊME compte administrateur (email + mot de passe,
+// obtenu via POST /admin/auth/login) que celui utilisé pour déverrouiller les notes.
+// Il n'y a donc plus de mot de passe partagé séparé pour le dashboard.
 app.use('/dashboard/*', async (c, next) => {
   const header = c.req.header('Authorization') || '';
   const queryToken = c.req.query('token');
@@ -982,11 +959,72 @@ app.use('/dashboard/*', async (c, next) => {
   if (!token) return error(c, 'Token manquant', 401);
   try {
     const p = await verify(token, secret!, 'HS256');
-    if (p.role !== 'dashboard') return error(c, 'Token invalide', 401);
+    if (p.role !== 'admin' || typeof p.sub !== 'string' || !uuid.safeParse(p.sub).success) {
+      return error(c, 'Token invalide', 401);
+    }
+    const admin = await prisma.administrateur.findUnique({ where: { id_admin: p.sub }, select: { est_actif: true } });
+    if (!admin?.est_actif) return error(c, 'Compte administrateur inactif', 403);
+    c.set('actor', { id: p.sub, role: 'admin' });
   } catch {
     return error(c, 'Session expirée ou invalide', 401);
   }
   await next();
+});
+
+// Profil de l'administrateur connecté : consultation et mise à jour (email, mot de passe, nom).
+// L'id_admin n'est jamais modifiable depuis cette route (c'est la clé primaire).
+app.get('/dashboard/profil', async c => {
+  const { id } = c.get('actor');
+  const admin = await prisma.administrateur.findUnique({
+    where: { id_admin: id },
+    select: { id_admin: true, email: true, nom_complet: true, est_actif: true }
+  });
+  if (!admin) return error(c, 'Administrateur introuvable', 404);
+  return c.json(admin);
+});
+
+const profilAdminSchema = z.object({
+  email: z.string().email().optional(),
+  mot_de_passe: z.string().min(8, 'Le mot de passe doit contenir au moins 8 caractères').optional(),
+  mot_de_passe_actuel: z.string().min(1).optional(),
+  nom_complet: z.string().min(1).optional()
+}).refine(v => v.email || v.mot_de_passe || v.nom_complet, { message: 'Aucune modification fournie' });
+
+app.put('/dashboard/profil', async c => {
+  const { id } = c.get('actor');
+  const body = profilAdminSchema.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return c.json({ error: 'Données invalides', details: body.error.flatten() }, 400);
+
+  const admin = await prisma.administrateur.findUnique({ where: { id_admin: id } });
+  if (!admin) return error(c, 'Administrateur introuvable', 404);
+
+  // Changer le mot de passe ou l'email exige de reconfirmer le mot de passe actuel,
+  // pour éviter qu'une session volée ne verrouille le vrai titulaire du compte.
+  if (body.data.mot_de_passe || body.data.email) {
+    if (!body.data.mot_de_passe_actuel || !(await bcrypt.compare(body.data.mot_de_passe_actuel, admin.mot_de_passe))) {
+      return error(c, 'Mot de passe actuel incorrect', 401);
+    }
+  }
+
+  const data: Prisma.AdministrateurUpdateInput = {};
+  if (body.data.email) data.email = body.data.email.trim().toLowerCase();
+  if (body.data.nom_complet) data.nom_complet = body.data.nom_complet.trim();
+  if (body.data.mot_de_passe) data.mot_de_passe = await bcrypt.hash(body.data.mot_de_passe, 10);
+
+  try {
+    const updated = await prisma.administrateur.update({
+      where: { id_admin: id },
+      data,
+      select: { id_admin: true, email: true, nom_complet: true, est_actif: true }
+    });
+    return c.json({ success: true, message: 'Profil mis à jour', admin: updated });
+  } catch (e) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      return error(c, 'Cet email est déjà utilisé par un autre administrateur', 409);
+    }
+    console.error('Mise à jour profil admin', e);
+    return error(c, 'Échec de la mise à jour du profil');
+  }
 });
 
 // ---------------------------------------------------------------------------

@@ -98,10 +98,11 @@ model Enseignant {
 // --------------------------------------------------
 
 model Administrateur {
-  id_admin     String  @id @default(uuid()) @db.Uuid
-  nom_complet  String
-  mot_de_passe String
-  est_actif    Boolean @default(true)
+  id_admin      String  @id @default(uuid()) @db.Uuid
+  nom_complet   String
+  email         String? @unique
+  mot_de_passe  String
+  est_actif     Boolean @default(true)
 
   verrouillages VerrouillageNote[]
 }
